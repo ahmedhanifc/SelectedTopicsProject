@@ -245,7 +245,15 @@ def load_video_frames_from_jpg_images(
         for p in os.listdir(jpg_folder)
         if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
     ]
-    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0][5:]))
+
+    def _frame_sort_key(name):
+        stem = os.path.splitext(name)[0]
+        if stem.startswith("frame_"):
+            return int(stem[6:])
+        return int(stem)
+
+    frame_names.sort(key=_frame_sort_key)
+
     #TODO: Need to handle this better
     # bcs maskrcnn prediction didnt have it for last frame 
     # frame_names = frame_names[:-1]

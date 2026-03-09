@@ -1,5 +1,12 @@
 data/
+dataset/
+frame_root/
+output_masks/
+checkpoints/
 src/sam2/checkpoints
+src/sam2/sam2/checkpoints/
+SDS_Playground/
+google_drive_upload/
 src/sam2/eval_sasvi_live_maskrcnn_nnunet.py
 src/sam2/eval_sasvi_old.py
 
@@ -170,3 +177,7 @@ results/
 tmp/
 *_weights.pth
 *_weights.npy
+*.pt
+*.pth
+*.ckpt
+*.safetensors
