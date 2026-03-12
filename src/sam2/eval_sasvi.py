@@ -27,6 +27,13 @@ from sds_playground.datasets.cataract1k.cataract1ksegm_visualisation import get_
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from sam2.build_sam import build_sam2_video_predictor
+from analysis_tools.inference_export import (
+    INFERENCE_METADATA_COLUMNS,
+    compute_confidence_map,
+    save_confidence_map,
+    summarise_confidence_map,
+    write_rows_to_csv,
+)
 from src.sam2_utils import kmeans_sampling
 from src.data import remap_labels, insert_component_masks
 from src.utils import process_detr_outputs, process_mask2former_outputs
@@ -508,6 +515,7 @@ def sasvi_inference(
 
     score_thresh=0.0,
     save_binary_mask=False,
+    analysis_output_dir=None,
 ):
     """Run inference on a single video with the given predictor."""
     video_dir = os.path.join(base_video_dir, video_name)
@@ -534,6 +542,11 @@ def sasvi_inference(
     height = inference_state["video_height"]
     width = inference_state["video_width"]
     break_endless_loop = False
+    inference_rows = {}
+    confidence_dir = None
+    if analysis_output_dir is not None:
+        confidence_dir = os.path.join(analysis_output_dir, "inference", "confidence_maps", video_name)
+        os.makedirs(confidence_dir, exist_ok=True)
 
     # run propagation throughout the video and collect the results in a dict
     os.makedirs(os.path.join(output_mask_dir, video_name), exist_ok=True)
@@ -635,6 +648,22 @@ def sasvi_inference(
                 out_obj_id: (out_mask_logits[i] > score_thresh).cpu().numpy()
                 for i, out_obj_id in enumerate(out_obj_ids)
             }
+            if confidence_dir is not None and len(out_obj_ids) > 0:
+                confidence_map = compute_confidence_map(out_mask_logits)
+                confidence_path = os.path.join(
+                    confidence_dir,
+                    f"{frame_names[out_frame_idx]}_confidence.png",
+                )
+                save_confidence_map(confidence_path, confidence_map)
+                confidence_stats = summarise_confidence_map(confidence_map)
+                inference_rows[frame_names[out_frame_idx]] = {
+                    "video_name": video_name,
+                    "frame_name": frame_names[out_frame_idx],
+                    "frame_idx": out_frame_idx,
+                    "num_objects": len(out_obj_ids),
+                    "confidence_path": confidence_path,
+                    **confidence_stats,
+                }
             # write the output masks as palette PNG files to output_mask_dir
             save_masks_to_dir(
                 output_mask_dir=output_mask_dir,
@@ -774,6 +803,7 @@ def sasvi_inference(
 
                 old_label = list(set(old_label) & set(current_label)) + prompt_label_list
             idx += 1    
+    return [inference_rows[key] for key in sorted(inference_rows)]
 
 
 def main():
@@ -860,6 +890,11 @@ def main():
         "--nnunet_mask_dir",
         type=str,
         help="directory to save predicted masks from nnunet of each video.",
+    )
+    parser.add_argument(
+        "--analysis_output_dir",
+        type=str,
+        help="optional directory for confidence maps and inference metadata exported for analysis.",
     )
     args = parser.parse_args()
 
@@ -973,10 +1008,11 @@ def main():
 
     print(f"running SASVI prediction on {len(video_names)} videos:\n{video_names}")
     start_time = time.time()
+    inference_rows = []
     
     for n_video, video_name in enumerate(video_names):
         print(f"\n{n_video + 1}/{len(video_names)} - running on {video_name}")
-        sasvi_inference(
+        inference_rows.extend(sasvi_inference(
             predictor=predictor,
             base_video_dir=args.base_video_dir,
             output_mask_dir=args.output_mask_dir,
@@ -995,7 +1031,12 @@ def main():
             
             score_thresh=args.score_thresh,
             save_binary_mask=args.save_binary_mask,
-        )
+            analysis_output_dir=args.analysis_output_dir,
+        ))
+
+    if args.analysis_output_dir is not None and len(inference_rows) > 0:
+        metadata_path = os.path.join(args.analysis_output_dir, "inference", "inference_metadata.csv")
+        write_rows_to_csv(metadata_path, inference_rows, INFERENCE_METADATA_COLUMNS)
 
     elapsed_time = time.time() - start_time
     print(f"Time taken: {elapsed_time:.6f} seconds")
