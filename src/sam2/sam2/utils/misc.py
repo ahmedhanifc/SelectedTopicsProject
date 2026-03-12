@@ -253,7 +253,6 @@ def load_video_frames_from_jpg_images(
         return int(stem)
 
     frame_names.sort(key=_frame_sort_key)
-
     #TODO: Need to handle this better
     # bcs maskrcnn prediction didnt have it for last frame 
     # frame_names = frame_names[:-1]
