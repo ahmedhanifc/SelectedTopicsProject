@@ -49,12 +49,25 @@ cd src/sam2
 python eval_sasvi.py \
   --device cpu \
   --sam2_cfg configs/sam2.1_hiera_l.yaml \
-  --sam2_checkpoint /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/src/sam2/sam2/checkpoints/sam2 1_hiera_large.pt \
+  --sam2_checkpoint /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/src/sam2/sam2/checkpoints/sam2.1_hiera_large.pt \
   --overseer_checkpoint /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/checkpoints/cholecseg8k_maskrcnn_best_val_f1.pth \
   --overseer_type MaskRCNN \
   --dataset_type CHOLECSEG8K \
   --base_video_dir /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/frame_root \
-  --output_mask_dir /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/output_masks
+  --output_mask_dir /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/output_masks \
+  --analysis_output_dir /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/analysis_output
+
 
   # Output:
 output_masks/video01_28660/
+
+# Error Report
+
+python analysis_tools/run_error_analysis.py \
+  --frames_root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/frame_root \
+  --pred_root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/output_masks \
+  --gt_root /PATH/TO/GROUND_TRUTH_MASKS \
+  --output_root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/analysis_output/report \
+  --dataset_type CHOLECSEG8K \
+  --confidence_root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/analysis_output/inference/confidence_maps
+
