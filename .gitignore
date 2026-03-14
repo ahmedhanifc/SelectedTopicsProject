@@ -181,3 +181,7 @@ tmp/
 *.pth
 *.ckpt
 *.safetensors
+
+# output folders
+analysis_output/
+stream_outputs/
