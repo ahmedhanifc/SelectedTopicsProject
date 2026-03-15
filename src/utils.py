@@ -12,9 +12,6 @@ from torch.utils.data import Dataset
 from transformers import (DetrImageProcessor, DetrForSegmentation, Mask2FormerForUniversalSegmentation,
                           Mask2FormerImageProcessor)
 
-from sds_playground.datasets import CaDISv2_Dataset, CholecSeg8kDataset, Cataract1kSegmentationDataset
-from sds_playground.utils import convert_to_integer_mask, convert_mask_to_RGB, denormalize
-
 from src.model import get_model_instance_segmentation
 from src.data import insert_component_masks, remap_labels, remove_mask_overlap
 
@@ -78,6 +75,7 @@ def visualise_results(images_list: list,
     :param name: File name for saving the plot
     :return:
     """
+    from sds_playground.utils import convert_to_integer_mask, convert_mask_to_RGB, denormalize
 
     N = min(len(targets), max_img_count)
     fig, ax = plt.subplots(nrows=5, ncols=N, figsize=(3 * N, 10))
@@ -221,6 +219,8 @@ def visualise_loss_and_metrics(train_loss_per_ep: list,
 
 
 def load_ds(chckpt: Path, data: Path, img_size: tuple) -> (Dataset, list[int], bool):
+    from sds_playground.datasets import CaDISv2_Dataset, CholecSeg8kDataset, Cataract1kSegmentationDataset
+
     if 'CADIS' in str(chckpt).upper():
         ds = CaDISv2_Dataset(
             root=data,
