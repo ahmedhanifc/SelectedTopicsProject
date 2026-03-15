@@ -55,3 +55,17 @@ Other useful optional arguments:
 * `--score_thresh 0.0` to change the SAM2 mask threshold if needed
 * `--render_alpha 0.35` to change overlay transparency
 * `--save_binary_mask` if you also want `.npz` binary masks
+
+# Run parallel frame Pipeline
+
+Use this from the project root in `cmd`:
+
+python parallel_sasvi_frames.py ^
+    --base_video_dir C:\Users\Test\Desktop\SelectedTopicsProject\frame_root ^
+    --output_root C:\Users\Test\Desktop\SelectedTopicsProject\parallel_frame_outputs ^
+    --sam2_cfg C:\Users\Test\Desktop\SelectedTopicsProject\src\sam2\sam2\configs\sam2.1_hiera_l.yaml ^
+    --sam2_checkpoint C:\Users\Test\Desktop\SelectedTopicsProject\src\sam2\sam2\checkpoints\sam2.1_hiera_large.pt ^
+    --overseer_checkpoint C:\Users\Test\Desktop\SelectedTopicsProject\checkpoints\cholecseg8k_maskrcnn_best_val_f1.pth ^
+    --overseer_type MaskRCNN ^
+    --dataset_type CHOLECSEG8K ^
+    --device cuda 
