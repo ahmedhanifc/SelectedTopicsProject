@@ -1,0 +1,13 @@
+{
+  "dataset_type": "CHOLECSEG8K",
+  "videos": {
+    "video01_28660": {
+      "frames": 1
+    }
+  },
+  "frames_analyzed": 1,
+  "macro_iou_mean": 0.7111530254804456,
+  "macro_dice_mean": 0.7734725180981207,
+  "pixel_accuracy_mean": 0.928681206088993,
+  "error_rate_mean": 0.07131879391100703
+}
