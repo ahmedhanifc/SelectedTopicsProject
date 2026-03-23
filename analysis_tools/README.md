@@ -57,6 +57,10 @@ The report generator matches by:
 - video directory name
 - frame stem
 
+When confidence maps are available, the error map applies pattern bands only on
+the `Correct / no error` region so you can distinguish low-, medium-, and
+high-confidence correct predictions without changing the existing error colors.
+
 ## Output artifacts
 
 For each analyzed frame, the report saves:

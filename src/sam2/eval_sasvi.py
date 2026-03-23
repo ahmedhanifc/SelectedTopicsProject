@@ -649,7 +649,11 @@ def sasvi_inference(
                 for i, out_obj_id in enumerate(out_obj_ids)
             }
             if confidence_dir is not None and len(out_obj_ids) > 0:
-                confidence_map = compute_confidence_map(out_mask_logits)
+                confidence_map = compute_confidence_map(
+                    out_mask_logits,
+                    object_ids=out_obj_ids,
+                    score_thresh=score_thresh,
+                )
                 confidence_path = os.path.join(
                     confidence_dir,
                     f"{frame_names[out_frame_idx]}_confidence.png",
