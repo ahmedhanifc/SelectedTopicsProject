@@ -143,13 +143,51 @@ def _blend(base: np.ndarray, overlay: np.ndarray, alpha: float) -> np.ndarray:
     return blended.astype(np.uint8)
 
 
+def _build_confidence_stripe_mask(shape_hw: tuple[int, int],
+                                  confidence_map: np.ndarray,
+                                  min_period: int = 4,
+                                  max_period: int = 18,
+                                  stripe_width: int = 2) -> np.ndarray:
+    height, width = shape_hw
+    yy, xx = np.indices((height, width))
+    confidence = np.clip(confidence_map, 0.0, 1.0)
+    periods = np.rint(max_period - confidence * (max_period - min_period)).astype(np.int32)
+    periods = np.clip(periods, min_period, max_period)
+    stripe_mask = ((xx + yy) % periods) < stripe_width
+    return stripe_mask
+
+
+def _apply_confidence_pattern(pred_mask: np.ndarray,
+                              pred_rgb: np.ndarray,
+                              confidence_map: np.ndarray | None,
+                              background_index: int | None,
+                              ignore_index: int | None) -> np.ndarray:
+    if confidence_map is None:
+        return pred_rgb.copy()
+
+    patterned = pred_rgb.copy()
+    stripe_mask = _build_confidence_stripe_mask(pred_mask.shape, confidence_map)
+
+    foreground_mask = np.ones_like(pred_mask, dtype=bool)
+    if background_index is not None:
+        foreground_mask &= pred_mask != background_index
+    if ignore_index is not None:
+        foreground_mask &= pred_mask != ignore_index
+
+    active_stripes = np.logical_and(foreground_mask, stripe_mask)
+    patterned[active_stripes] = np.clip(patterned[active_stripes].astype(np.float32) * 0.25, 0, 255).astype(np.uint8)
+    return patterned
+
+
 def _make_overlay(image: np.ndarray,
                   pred_rgb: np.ndarray,
+                  pred_pattern_rgb: np.ndarray,
                   gt_rgb: np.ndarray,
                   error_map: np.ndarray,
                   confidence_map: np.ndarray | None) -> np.ndarray:
     image = image[:, :, :3].astype(np.uint8)
     pred_overlay = _blend(image, pred_rgb, alpha=0.45)
+    pred_pattern_overlay = _blend(image, pred_pattern_rgb, alpha=0.55)
     gt_overlay = _blend(image, gt_rgb, alpha=0.45)
     error_overlay = _blend(image, error_map, alpha=0.60)
 
@@ -159,10 +197,10 @@ def _make_overlay(image: np.ndarray,
         confidence_uint8 = (np.clip(confidence_map, 0.0, 1.0) * 255).astype(np.uint8)
         confidence_rgb = np.stack([confidence_uint8] * 3, axis=-1)
 
-    top = np.concatenate([image, pred_overlay], axis=1)
-    bottom = np.concatenate([gt_overlay, error_overlay], axis=1)
+    top = np.concatenate([image, pred_overlay, pred_pattern_overlay], axis=1)
+    bottom = np.concatenate([gt_overlay, error_overlay, pred_pattern_rgb], axis=1)
     if confidence_map is not None:
-        confidence_panel = np.concatenate([confidence_rgb, confidence_rgb], axis=1)
+        confidence_panel = np.concatenate([confidence_rgb, confidence_rgb, confidence_rgb], axis=1)
         overlay = np.concatenate([top, bottom, confidence_panel], axis=0)
     else:
         overlay = np.concatenate([top, bottom], axis=0)
@@ -262,13 +300,21 @@ def analyze_predictions(frame_root: Path,
             pred_classes = sorted(np.unique(pred_mask[valid_mask]).tolist())
             gt_classes = sorted(np.unique(gt_mask[valid_mask]).tolist())
             pred_rgb = _colorize_mask(pred_mask, dataset_config.palette, dataset_config.ignore_index)
+            pred_pattern_rgb = _apply_confidence_pattern(
+                pred_mask=pred_mask,
+                pred_rgb=pred_rgb,
+                confidence_map=confidence_map,
+                background_index=dataset_config.background_index,
+                ignore_index=dataset_config.ignore_index,
+            )
             gt_rgb = _colorize_mask(gt_mask, dataset_config.palette, dataset_config.ignore_index)
             error_map = _build_error_map(pred_mask, gt_mask, valid_mask, dataset_config.background_index)
-            overlay = _make_overlay(image, pred_rgb, gt_rgb, error_map, confidence_map)
+            overlay = _make_overlay(image, pred_rgb, pred_pattern_rgb, gt_rgb, error_map, confidence_map)
 
             artifact_dir = output_root / "artifacts" / video_name
             artifact_dir.mkdir(parents=True, exist_ok=True)
             pred_artifact_path = artifact_dir / f"{frame_name}_pred_rgb.png"
+            pred_pattern_artifact_path = artifact_dir / f"{frame_name}_pred_confidence_pattern.png"
             gt_artifact_path = artifact_dir / f"{frame_name}_gt_rgb.png"
             error_artifact_path = artifact_dir / f"{frame_name}_error_map.png"
             overlay_artifact_path = artifact_dir / f"{frame_name}_overlay.png"
@@ -276,6 +322,7 @@ def analyze_predictions(frame_root: Path,
 
             Image.fromarray(image).save(image_artifact_path)
             Image.fromarray(pred_rgb).save(pred_artifact_path)
+            Image.fromarray(pred_pattern_rgb).save(pred_pattern_artifact_path)
             Image.fromarray(gt_rgb).save(gt_artifact_path)
             Image.fromarray(error_map).save(error_artifact_path)
             Image.fromarray(overlay).save(overlay_artifact_path)
