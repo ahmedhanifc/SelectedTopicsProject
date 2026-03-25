@@ -184,6 +184,7 @@ tmp/
 
 # output folders
 analysis_output/
+analysis_output_parallel/
 stream_outputs/
 output_masks_timed/
 parallel_frame_outputs/

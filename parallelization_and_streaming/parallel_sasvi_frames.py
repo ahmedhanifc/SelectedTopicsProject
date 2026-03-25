@@ -21,7 +21,7 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "sam2"))
 
 from sam2.build_sam import build_sam2_video_predictor
 from src.sam2.eval_sasvi import save_masks_to_dir
-from stream_sasvi_video import (
+from parallelization_and_streaming.stream_sasvi_video import (
     SENTINEL,
     DatasetConfig,
     Metrics,
