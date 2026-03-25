@@ -188,10 +188,12 @@ tmp/
 
 # output folders
 analysis_output/
-analysis_output_parallel/
 stream_outputs/
-output_masks_timed/
-parallel_frame_outputs/
+old_tests/
+
+disagreement_frame_outputs/
+parallel_disagreement_frame_outputs/
 
 running_commands.txt
 PARALLEL_SASVI_FRAMES_REPORT.md
+JIJI_README.md
