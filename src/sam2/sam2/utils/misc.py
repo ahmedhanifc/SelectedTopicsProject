@@ -244,6 +244,7 @@ def load_video_frames_from_image_folder(
         p
         for p in os.listdir(image_folder)
         if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG"]
+        and "_mask" not in os.path.splitext(p)[0]
     ]
 
     def _frame_sort_key(name):
