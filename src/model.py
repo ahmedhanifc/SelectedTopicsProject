@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import ResNet50_Weights, ResNet18_Weights, ResNet34_Weights
-from torchvision.models.detection import MaskRCNN, maskrcnn_resnet50_fpn_v2, MaskRCNN_ResNet50_FPN_V2_Weights
+from torchvision.models.detection import MaskRCNN, maskrcnn_resnet50_fpn_v2
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, TwoMLPHead
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor, MaskRCNNHeads
@@ -66,8 +66,8 @@ def get_model_instance_segmentation(num_classes: int,
     # Load pre-trained model for instance segmentation
     match backbone.upper():
         case 'RESNET50':
-            model = maskrcnn_resnet50_fpn_v2(weights=MaskRCNN_ResNet50_FPN_V2_Weights.COCO_V1,
-                                             weights_backbone=ResNet50_Weights.IMAGENET1K_V2,
+            model = maskrcnn_resnet50_fpn_v2(weights=None,
+                                             weights_backbone=None,
                                              trainable_backbone_layers=trainable_backbone_layers,
                                              min_size=img_size[0],
                                              max_size=img_size[0])
