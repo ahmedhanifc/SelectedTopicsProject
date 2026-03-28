@@ -187,7 +187,6 @@ tmp/
 *.safetensors
 
 # output folders
-analysis_output/
 stream_outputs/
 old_tests/
 
@@ -197,3 +196,9 @@ parallel_disagreement_frame_outputs/
 running_commands.txt
 PARALLEL_SASVI_FRAMES_REPORT.md
 JIJI_README.md
+
+analysis_output/**
+analysis_output_disagreement/**
+analysis_output_disagreement_parallel/**
+**/confidence_maps/
+*.png
