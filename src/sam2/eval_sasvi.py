@@ -2,15 +2,24 @@
 #TODO: Prediction on reverse direction when overseer prediction confidence is high
 #TODO: Fine-tune SAM2 on the dataset
 
-import os
-import cv2
-import sys
-import time
-import numpy as np
-import torch
 import argparse
 import itertools
+import os
+import sys
 import tempfile
+import time
+
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "mpl"))
+os.environ.setdefault("XDG_CACHE_HOME", tempfile.gettempdir())
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
+import cv2
+import numpy as np
+import torch
 from PIL import Image
 import matplotlib.pyplot as plt
 from skimage.transform import resize
@@ -97,6 +106,23 @@ from analysis_tools.inference_export import (
     write_rows_to_csv,
     write_markdown_report,
 )
+from analysis_tools.config import get_dataset_config
+from analysis_tools.error_analysis import compute_frame_metrics, load_dataset_mask
+
+
+def configure_cpu_runtime():
+    cv2.setNumThreads(1)
+    try:
+        cv2.ocl.setUseOpenCL(False)
+    except AttributeError:
+        pass
+
+    cpu_threads = max(1, min(4, os.cpu_count() or 1))
+    torch.set_num_threads(cpu_threads)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
 from src.sam2_utils import kmeans_sampling
 from src.data import remap_labels, insert_component_masks
 from src.utils import process_detr_outputs, process_mask2former_outputs
@@ -299,6 +325,33 @@ def build_frame_subset_dir(video_name, frame_infos, output_root=None):
         dst_path = os.path.join(subset_dir, f"{frame_info['stem']}{frame_info['ext']}")
         os.symlink(os.path.abspath(frame_info["path"]), dst_path)
     return subset_root, subset_dir
+
+
+GT_MASK_SUFFIX_CANDIDATES = (
+    "_watershed_mask.png",
+    "_color_mask.png",
+    "_mask.png",
+)
+
+
+def resolve_gt_mask_path(frame_name, video_dir, video_name, base_video_dir, gt_root_dir=None):
+    candidate_roots = []
+    if gt_root_dir is not None:
+        relative_video_dir = os.path.relpath(video_dir, start=base_video_dir)
+        candidate_roots.append(os.path.join(gt_root_dir, relative_video_dir))
+        candidate_roots.append(os.path.join(gt_root_dir, video_name))
+    candidate_roots.append(video_dir)
+
+    seen_paths = set()
+    for root in candidate_roots:
+        for suffix in GT_MASK_SUFFIX_CANDIDATES:
+            candidate = os.path.abspath(os.path.join(root, f"{frame_name}{suffix}"))
+            if candidate in seen_paths:
+                continue
+            seen_paths.add(candidate)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
 
 
 def ensure_cached_overseer_prediction(cache, frame_idx, frame_names, frame_path_by_name, overseer_model, reshape_size):
@@ -822,7 +875,9 @@ def sasvi_inference(
     shift_by_1,
     palette,
     dataset_type,
+    gt_dataset_config,
     video_dir=None,
+    gt_root_dir=None,
     start_frame=None,
     end_frame=None,
     frame_name=None,
@@ -910,8 +965,15 @@ def sasvi_inference(
         "disagreement_reprompts": 0,
         "mean_iou": 1.0,
         "min_iou": 1.0,
+        "gt_frames_evaluated": 0,
+        "gt_macro_iou_mean": None,
+        "gt_macro_dice_mean": None,
+        "gt_pixel_accuracy_mean": None,
     }
     per_frame_ious = []
+    gt_macro_ious = []
+    gt_macro_dices = []
+    gt_pixel_accuracies = []
     prompt_label_list = []
     negative_duplicate_list = []
     old_label = []
@@ -1107,6 +1169,46 @@ def sasvi_inference(
                     shift_by_1=shift_by_1,
                 )
 
+            gt_mask_path = resolve_gt_mask_path(
+                frame_name=frame_names[out_frame_idx],
+                video_dir=video_dir,
+                video_name=video_name,
+                base_video_dir=base_video_dir,
+                gt_root_dir=gt_root_dir,
+            )
+            gt_metrics = {
+                "gt_mask_path": gt_mask_path,
+                "gt_pixel_accuracy": None,
+                "gt_macro_iou": None,
+                "gt_macro_dice": None,
+                "gt_error_rate": None,
+            }
+            if gt_mask_path is not None:
+                pred_label_map = per_obj_mask_to_label_map(
+                    per_obj_mask=per_obj_output_mask,
+                    height=height,
+                    width=width,
+                    shift_by_1=shift_by_1,
+                )
+                gt_label_map = load_dataset_mask(gt_mask_path, gt_dataset_config)
+                gt_frame_metrics = compute_frame_metrics(
+                    pred_mask=pred_label_map,
+                    gt_mask=gt_label_map,
+                    dataset_config=gt_dataset_config,
+                )
+                if gt_frame_metrics["macro_iou"] is not None:
+                    gt_metrics = {
+                        "gt_mask_path": gt_mask_path,
+                        "gt_pixel_accuracy": gt_frame_metrics["pixel_accuracy"],
+                        "gt_macro_iou": gt_frame_metrics["macro_iou"],
+                        "gt_macro_dice": gt_frame_metrics["macro_dice"],
+                        "gt_error_rate": gt_frame_metrics["error_rate"],
+                    }
+                    gt_macro_ious.append(gt_frame_metrics["macro_iou"])
+                    gt_macro_dices.append(gt_frame_metrics["macro_dice"])
+                    gt_pixel_accuracies.append(gt_frame_metrics["pixel_accuracy"])
+                    video_summary["gt_frames_evaluated"] += 1
+
             bad_disagreement_frame = False
             if enable_disagreement_gate and out_frame_idx > segment_start_idx:
                 bad_disagreement_frame = disagreement_metrics["iou"] < disagreement_iou_threshold
@@ -1281,6 +1383,7 @@ def sasvi_inference(
                 "disagreement_trigger": disagreement_trigger,
                 "reprompt_executed": reprompt_executed,
                 "reprompt_reason": reprompt_reason,
+                **gt_metrics,
             }
             trace_rows.append(trace_row)
             print(
@@ -1331,6 +1434,10 @@ def sasvi_inference(
     if per_frame_ious:
         video_summary["mean_iou"] = float(np.mean(per_frame_ious))
         video_summary["min_iou"] = float(np.min(per_frame_ious))
+    if gt_macro_ious:
+        video_summary["gt_macro_iou_mean"] = float(np.mean(gt_macro_ious))
+        video_summary["gt_macro_dice_mean"] = float(np.mean(gt_macro_dices))
+        video_summary["gt_pixel_accuracy_mean"] = float(np.mean(gt_pixel_accuracies))
     return trace_rows, video_summary
 
 
@@ -1451,6 +1558,11 @@ def main():
         help="optional directory for confidence maps and inference metadata exported for analysis.",
     )
     parser.add_argument(
+        "--gt_root_dir",
+        type=str,
+        help="optional root directory for ground-truth masks. If omitted, GT masks are searched next to the input frames.",
+    )
+    parser.add_argument(
         "--enable_disagreement_gate",
         action="store_true",
         help="enable disagreement-gated corrective re-prompting.",
@@ -1496,6 +1608,8 @@ def main():
         raise ValueError("--disagreement_bad_frames must be >= 1")
     if args.video_name is not None and args.video_names is not None:
         raise ValueError("Use either --video_name or --video_names, not both")
+    if str(args.device).lower().startswith("cpu"):
+        configure_cpu_runtime()
 
     # if we use per-object PNG files, they could possibly overlap in inputs and outputs
     hydra_overrides_extra = [
@@ -1558,6 +1672,7 @@ def main():
         raise NotImplementedError
 
     palette = get_primary_visual_palette(num_classes)
+    gt_dataset_config = get_dataset_config(args.dataset_type)
 
     if args.overseer_type == "MaskRCNN":
         maskrcnn_model = get_model_instance_segmentation(
@@ -1645,6 +1760,8 @@ def main():
             shift_by_1=shift_by_1,
             palette=palette,
             dataset_type=args.dataset_type,
+            gt_dataset_config=gt_dataset_config,
+            gt_root_dir=args.gt_root_dir,
             
             score_thresh=args.score_thresh,
             save_binary_mask=args.save_binary_mask,
@@ -1670,6 +1787,7 @@ def main():
                 "device": args.device,
                 "dataset_type": args.dataset_type,
                 "base_video_dir": args.base_video_dir,
+                "gt_root_dir": args.gt_root_dir,
                 "video_name": args.video_name,
                 "video_names": args.video_names,
                 "frame_name": args.frame_name,
