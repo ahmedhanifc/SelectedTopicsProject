@@ -73,6 +73,7 @@ class DatasetConfig:
     ignore_index: int | None
     background_index: int | None
     palette: np.ndarray
+    rgb_label_map: dict[tuple[int, int, int], int] | None = None
 
 
 def _normalise_palette(palette: np.ndarray | list) -> np.ndarray:
@@ -96,13 +97,32 @@ def get_dataset_config(dataset_type: str,
         default_background = 0
         num_classes = 13
         palette = get_cholecseg8k_colormap()
+        rgb_label_map = {
+            (255, 255, 255): 0,
+            (50, 50, 50): 0,
+            (11, 11, 11): 1,
+            (21, 21, 21): 2,
+            (13, 13, 13): 3,
+            (12, 12, 12): 4,
+            (31, 31, 31): 5,
+            (23, 23, 23): 6,
+            (24, 24, 24): 7,
+            (25, 25, 25): 8,
+            (32, 32, 32): 9,
+            (22, 22, 22): 10,
+            (33, 33, 33): 11,
+            (5, 5, 5): 12,
+        }
     elif dataset_key == "CATARACT1K":
         default_ignore = None
         default_background = 0
         num_classes = 14
         palette = get_cataract1k_colormap()
+        rgb_label_map = None
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
+    if dataset_key == "CADIS":
+        rgb_label_map = None
 
     return DatasetConfig(
         dataset_type=dataset_key,
@@ -110,4 +130,5 @@ def get_dataset_config(dataset_type: str,
         ignore_index=default_ignore if ignore_index is None else ignore_index,
         background_index=default_background if background_index is None else background_index,
         palette=_normalise_palette(palette),
+        rgb_label_map=rgb_label_map,
     )
