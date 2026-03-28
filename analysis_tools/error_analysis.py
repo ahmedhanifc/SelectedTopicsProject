@@ -5,10 +5,22 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from .config import DatasetConfig
 from .inference_export import write_rows_to_csv
+from .visual_config import (
+    BACKGROUND_BLUR_RADIUS,
+    BACKGROUND_DIM_FACTOR,
+    ERROR_OVERLAY_ALPHA,
+    GROUND_TRUTH_OVERLAY_ALPHA,
+    HIGH_CONFIDENCE_SPACING,
+    LOW_CONFIDENCE_SPACING,
+    MEDIUM_CONFIDENCE_SPACING,
+    PATTERN_LINE_WIDTH_DIVISOR,
+    PATTERN_LINE_WIDTH_MIN,
+    PREDICTION_OVERLAY_ALPHA,
+)
 
 
 REPORT_COLUMNS = [
@@ -143,31 +155,33 @@ def _blend(base: np.ndarray, overlay: np.ndarray, alpha: float) -> np.ndarray:
     return blended.astype(np.uint8)
 
 
-def _make_pattern_mask(shape_hw: tuple[int, int], spacing: int, style: str) -> np.ndarray:
+def _make_pattern_mask(shape_hw: tuple[int, int], spacing: int) -> np.ndarray:
     height, width = shape_hw
     yy, xx = np.indices((height, width))
-    if style == "diagonal":
-        return ((xx + yy) % spacing) < max(1, spacing // 4)
-    if style == "dots":
-        return ((xx % spacing) == 0) & ((yy % spacing) == 0)
-    if style == "checker":
-        cell = max(1, spacing // 3)
-        return ((xx % spacing) < cell) & ((yy % spacing) < cell)
-    raise ValueError(f"Unsupported pattern style: {style}")
+    line_width = max(PATTERN_LINE_WIDTH_MIN, spacing // PATTERN_LINE_WIDTH_DIVISOR)
+    return ((xx + yy) % spacing) < line_width
 
 
 def _apply_pattern_overlay(image: np.ndarray,
                            region_mask: np.ndarray,
                            color: np.ndarray,
-                           spacing: int,
-                           style: str) -> np.ndarray:
+                           spacing: int) -> np.ndarray:
     if not region_mask.any():
         return image
-    pattern_mask = _make_pattern_mask(image.shape[:2], spacing=spacing, style=style)
+    pattern_mask = _make_pattern_mask(image.shape[:2], spacing=spacing)
     mask = np.logical_and(region_mask, pattern_mask)
     output = image.copy()
     output[mask] = color
     return output
+
+
+def _soften_image(image: np.ndarray,
+                  blur_radius: float = BACKGROUND_BLUR_RADIUS,
+                  dim_factor: float = BACKGROUND_DIM_FACTOR) -> np.ndarray:
+    softened = Image.fromarray(image.astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    softened_np = np.array(softened, dtype=np.float32)
+    softened_np *= dim_factor
+    return np.clip(softened_np, 0, 255).astype(np.uint8)
 
 
 def _stack_confidence_rgb(confidence_map: np.ndarray | None, image_shape: tuple[int, int, int]) -> np.ndarray:
@@ -220,22 +234,20 @@ def _make_legend_strip(width: int,
         draw.text((12, y), "Confidence patterns on correct / no-error pixels:", fill=(255, 255, 255), font=font)
         x = 250
         draw.rectangle((x, y, x + 34, y + 14), fill=(0, 0, 0), outline=(255, 255, 255))
-        for offset in range(-14, 35, 6):
+        for offset in range(-14, 35, 4):
             draw.line((x + offset, y, x + offset + 14, y + 14), fill=(255, 255, 255), width=1)
         draw.text((x + 42, y), f"low <= {low_threshold:.2f}", fill=(235, 235, 235), font=font)
 
         x += 150
         draw.rectangle((x, y, x + 34, y + 14), fill=(0, 0, 0), outline=(255, 255, 255))
-        for px in range(x + 4, x + 34, 8):
-            for py in range(y + 4, y + 14, 8):
-                draw.point((px, py), fill=(255, 255, 255))
+        for offset in range(-14, 35, 7):
+            draw.line((x + offset, y, x + offset + 14, y + 14), fill=(255, 255, 255), width=1)
         draw.text((x + 42, y), f"{low_threshold:.2f} < medium <= {medium_threshold:.2f}", fill=(235, 235, 235), font=font)
 
         x += 210
         draw.rectangle((x, y, x + 34, y + 14), fill=(0, 0, 0), outline=(255, 255, 255))
-        for px in range(x + 3, x + 34, 12):
-            for py in range(y + 3, y + 14, 12):
-                draw.rectangle((px, py, min(px + 2, x + 33), min(py + 2, y + 13)), fill=(180, 180, 180))
+        for offset in range(-14, 35, 10):
+            draw.line((x + offset, y, x + offset + 14, y + 14), fill=(180, 180, 180), width=1)
         draw.text((x + 42, y), f"high > {medium_threshold:.2f}", fill=(235, 235, 235), font=font)
 
     return np.array(legend)
@@ -254,7 +266,8 @@ def _confidence_band_masks(confidence_map: np.ndarray,
     return low_confidence_mask, medium_confidence_mask, high_confidence_mask
 
 
-def _annotate_error_map(error_map: np.ndarray,
+def _annotate_error_map(image: np.ndarray,
+                        error_map: np.ndarray,
                         confidence_map: np.ndarray | None,
                         valid_mask: np.ndarray,
                         background_index: int | None,
@@ -262,7 +275,11 @@ def _annotate_error_map(error_map: np.ndarray,
                         has_confidence: bool,
                         low_threshold: float,
                         medium_threshold: float) -> np.ndarray:
-    annotated_map = error_map.copy()
+    softened_image = _soften_image(image[:, :, :3].astype(np.uint8))
+    annotated_map = softened_image.copy()
+    error_pixels = error_map.any(axis=2)
+    if error_pixels.any():
+        annotated_map[error_pixels] = _blend(softened_image[error_pixels], error_map[error_pixels], alpha=ERROR_OVERLAY_ALPHA)
     if confidence_map is not None:
         correct_region_mask = np.logical_and(valid_mask, ~error_map.any(axis=2))
         low_confidence_mask, medium_confidence_mask, high_confidence_mask = _confidence_band_masks(
@@ -274,23 +291,20 @@ def _annotate_error_map(error_map: np.ndarray,
         annotated_map = _apply_pattern_overlay(
             annotated_map,
             region_mask=high_confidence_mask,
-            color=np.array([176, 176, 176], dtype=np.uint8),
-            spacing=12,
-            style="checker",
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=HIGH_CONFIDENCE_SPACING,
         )
         annotated_map = _apply_pattern_overlay(
             annotated_map,
             region_mask=medium_confidence_mask,
             color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=8,
-            style="dots",
+            spacing=MEDIUM_CONFIDENCE_SPACING,
         )
         annotated_map = _apply_pattern_overlay(
             annotated_map,
             region_mask=low_confidence_mask,
             color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=10,
-            style="diagonal",
+            spacing=LOW_CONFIDENCE_SPACING,
         )
     legend = _make_legend_strip(
         width=annotated_map.shape[1],
@@ -312,9 +326,13 @@ def _make_overlay(image: np.ndarray,
                   background_index: int | None,
                   pred_mask: np.ndarray) -> np.ndarray:
     image = image[:, :, :3].astype(np.uint8)
-    pred_overlay = _blend(image, pred_rgb, alpha=0.45)
-    gt_overlay = _blend(image, gt_rgb, alpha=0.45)
-    error_overlay = _blend(image, error_map, alpha=0.60)
+    pred_overlay = _blend(image, pred_rgb, alpha=PREDICTION_OVERLAY_ALPHA)
+    gt_overlay = _blend(image, gt_rgb, alpha=GROUND_TRUTH_OVERLAY_ALPHA)
+    softened_image = _soften_image(image)
+    error_overlay = softened_image.copy()
+    error_pixels = error_map.any(axis=2)
+    if error_pixels.any():
+        error_overlay[error_pixels] = _blend(softened_image[error_pixels], error_map[error_pixels], alpha=ERROR_OVERLAY_ALPHA)
 
     confidence_rgb = _stack_confidence_rgb(confidence_map, image.shape)
 
@@ -329,23 +347,20 @@ def _make_overlay(image: np.ndarray,
         pred_overlay = _apply_pattern_overlay(
             pred_overlay,
             region_mask=high_confidence_mask,
-            color=np.array([176, 176, 176], dtype=np.uint8),
-            spacing=12,
-            style="checker",
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=HIGH_CONFIDENCE_SPACING,
         )
         pred_overlay = _apply_pattern_overlay(
             pred_overlay,
             region_mask=medium_confidence_mask,
             color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=8,
-            style="dots",
+            spacing=MEDIUM_CONFIDENCE_SPACING,
         )
         pred_overlay = _apply_pattern_overlay(
             pred_overlay,
             region_mask=low_confidence_mask,
             color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=10,
-            style="diagonal",
+            spacing=LOW_CONFIDENCE_SPACING,
         )
         correct_region_mask = np.logical_and(valid_mask, ~error_map.any(axis=2))
         low_correct_confidence_mask, medium_correct_confidence_mask, high_correct_confidence_mask = _confidence_band_masks(
@@ -357,23 +372,20 @@ def _make_overlay(image: np.ndarray,
         error_overlay = _apply_pattern_overlay(
             error_overlay,
             region_mask=high_correct_confidence_mask,
-            color=np.array([176, 176, 176], dtype=np.uint8),
-            spacing=12,
-            style="checker",
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=HIGH_CONFIDENCE_SPACING,
         )
         error_overlay = _apply_pattern_overlay(
             error_overlay,
             region_mask=medium_correct_confidence_mask,
             color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=8,
-            style="dots",
+            spacing=MEDIUM_CONFIDENCE_SPACING,
         )
         error_overlay = _apply_pattern_overlay(
             error_overlay,
             region_mask=low_correct_confidence_mask,
             color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=10,
-            style="diagonal",
+            spacing=LOW_CONFIDENCE_SPACING,
         )
 
     top = np.concatenate([image, pred_overlay], axis=1)
@@ -512,6 +524,7 @@ def analyze_predictions(frame_root: Path,
                 pred_mask=pred_mask,
             )
             error_map_annotated = _annotate_error_map(
+                image=image,
                 error_map=error_map,
                 confidence_map=confidence_map,
                 valid_mask=valid_mask,
