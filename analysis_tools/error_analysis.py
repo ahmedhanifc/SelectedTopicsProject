@@ -53,7 +53,7 @@ REPORT_COLUMNS = [
 ]
 
 
-def _load_png_mask(path: Path, palette: np.ndarray | None) -> np.ndarray:
+def load_png_mask(path: Path, palette: np.ndarray | None) -> np.ndarray:
     with Image.open(path) as image:
         mask = np.array(image)
 
@@ -71,6 +71,102 @@ def _load_png_mask(path: Path, palette: np.ndarray | None) -> np.ndarray:
         return label_mask
 
     raise ValueError(f"Unsupported mask format in {path}")
+
+
+def load_dataset_mask(path: Path | str, dataset_config: DatasetConfig) -> np.ndarray:
+    path = Path(path)
+    with Image.open(path) as image:
+        mask = np.array(image)
+
+    if mask.ndim == 2:
+        if dataset_config.rgb_label_map:
+            scalar_map = {
+                rgb[0]: label
+                for rgb, label in dataset_config.rgb_label_map.items()
+                if rgb[0] == rgb[1] == rgb[2]
+            }
+            unique_values = set(np.unique(mask).tolist())
+            if unique_values and unique_values.issubset(set(scalar_map.keys())):
+                mapped = np.full(mask.shape, fill_value=255, dtype=np.uint8)
+                for value, label in scalar_map.items():
+                    mapped[mask == value] = label
+                return mapped
+        return mask.astype(np.uint8)
+
+    if mask.ndim == 3 and mask.shape[2] >= 3 and dataset_config.rgb_label_map:
+        rgb = mask[:, :, :3].astype(np.uint8)
+        unique_colors = {
+            tuple(color.tolist())
+            for color in np.unique(rgb.reshape(-1, rgb.shape[-1]), axis=0)
+        }
+        known_colors = set(dataset_config.rgb_label_map.keys())
+        if unique_colors and unique_colors.issubset(known_colors):
+            label_mask = np.full(rgb.shape[:2], fill_value=255, dtype=np.uint8)
+            for color, label in dataset_config.rgb_label_map.items():
+                label_mask[np.all(rgb == np.array(color, dtype=np.uint8), axis=-1)] = label
+            return label_mask
+
+    return load_png_mask(path, dataset_config.palette)
+
+
+def compute_frame_metrics(pred_mask: np.ndarray,
+                          gt_mask: np.ndarray,
+                          dataset_config: DatasetConfig) -> dict[str, Any]:
+    pred_mask = _resize_to_match(pred_mask.astype(np.uint8), gt_mask.shape[:2])
+    ignore_index = dataset_config.ignore_index
+    valid_mask = np.ones_like(gt_mask, dtype=bool)
+    if ignore_index is not None:
+        valid_mask &= gt_mask != ignore_index
+
+    valid_pixels = int(valid_mask.sum())
+    if valid_pixels == 0:
+        return {
+            "pixel_accuracy": None,
+            "macro_iou": None,
+            "macro_dice": None,
+            "error_pixels": None,
+            "error_rate": None,
+            "false_positive_pixels": None,
+            "false_negative_pixels": None,
+            "class_confusion_pixels": None,
+            "num_pred_classes": 0,
+            "num_gt_classes": 0,
+            "pred_classes": [],
+            "gt_classes": [],
+            "per_class_iou": {},
+            "per_class_dice": {},
+        }
+
+    labels = sorted(set(np.unique(pred_mask[valid_mask]).tolist()) | set(np.unique(gt_mask[valid_mask]).tolist()))
+    iou_scores, dice_scores = _collect_label_metrics(pred_mask, gt_mask, labels, valid_mask)
+    macro_iou = float(np.mean(list(iou_scores.values()))) if iou_scores else 0.0
+    macro_dice = float(np.mean(list(dice_scores.values()))) if dice_scores else 0.0
+    pixel_accuracy = float((pred_mask[valid_mask] == gt_mask[valid_mask]).mean())
+    error_pixels = int(np.logical_and(pred_mask != gt_mask, valid_mask).sum())
+    error_rate = float(error_pixels / valid_pixels)
+    false_positive_pixels, false_negative_pixels, class_confusion_pixels = _error_breakdown(
+        pred_mask=pred_mask,
+        gt_mask=gt_mask,
+        valid_mask=valid_mask,
+        background_index=dataset_config.background_index,
+    )
+
+    return {
+        "pixel_accuracy": pixel_accuracy,
+        "macro_iou": macro_iou,
+        "macro_dice": macro_dice,
+        "error_pixels": error_pixels,
+        "error_rate": error_rate,
+        "false_positive_pixels": false_positive_pixels,
+        "false_negative_pixels": false_negative_pixels,
+        "class_confusion_pixels": class_confusion_pixels,
+        "num_pred_classes": len(np.unique(pred_mask[valid_mask]).tolist()),
+        "num_gt_classes": len(np.unique(gt_mask[valid_mask]).tolist()),
+        "pred_classes": sorted(np.unique(pred_mask[valid_mask]).tolist()),
+        "gt_classes": sorted(np.unique(gt_mask[valid_mask]).tolist()),
+        "per_class_iou": iou_scores,
+        "per_class_dice": dice_scores,
+    }
 
 
 def _load_confidence_map(path: Path | None) -> np.ndarray | None:
@@ -315,6 +411,42 @@ def _annotate_error_map(base_canvas: np.ndarray,
     return np.concatenate([annotated_map, legend], axis=0)
 
 
+def _build_confidence_stripe_mask(shape_hw: tuple[int, int],
+                                  confidence_map: np.ndarray,
+                                  min_period: int = 4,
+                                  max_period: int = 18,
+                                  stripe_width: int = 2) -> np.ndarray:
+    height, width = shape_hw
+    yy, xx = np.indices((height, width))
+    confidence = np.clip(confidence_map, 0.0, 1.0)
+    periods = np.rint(max_period - confidence * (max_period - min_period)).astype(np.int32)
+    periods = np.clip(periods, min_period, max_period)
+    stripe_mask = ((xx + yy) % periods) < stripe_width
+    return stripe_mask
+
+
+def _apply_confidence_pattern(pred_mask: np.ndarray,
+                              pred_rgb: np.ndarray,
+                              confidence_map: np.ndarray | None,
+                              background_index: int | None,
+                              ignore_index: int | None) -> np.ndarray:
+    if confidence_map is None:
+        return pred_rgb.copy()
+
+    patterned = pred_rgb.copy()
+    stripe_mask = _build_confidence_stripe_mask(pred_mask.shape, confidence_map)
+
+    foreground_mask = np.ones_like(pred_mask, dtype=bool)
+    if background_index is not None:
+        foreground_mask &= pred_mask != background_index
+    if ignore_index is not None:
+        foreground_mask &= pred_mask != ignore_index
+
+    active_stripes = np.logical_and(foreground_mask, stripe_mask)
+    patterned[active_stripes] = np.clip(patterned[active_stripes].astype(np.float32) * 0.25, 0, 255).astype(np.uint8)
+    return patterned
+
+
 def _make_overlay(image: np.ndarray,
                   error_canvas: np.ndarray,
                   base_label: str,
@@ -461,8 +593,9 @@ def analyze_predictions(frame_root: Path,
             if not gt_path.exists():
                 continue
 
-            pred_mask = _load_png_mask(pred_file, dataset_config.palette)
-            gt_mask = _load_png_mask(gt_path, dataset_config.palette)
+            pred_mask = load_png_mask(pred_file, dataset_config.palette)
+            gt_mask = load_dataset_mask(gt_path, dataset_config)
+            metrics = compute_frame_metrics(pred_mask=pred_mask, gt_mask=gt_mask, dataset_config=dataset_config)
             pred_mask = _resize_to_match(pred_mask, gt_mask.shape[:2])
 
             confidence_path = None
@@ -478,6 +611,8 @@ def analyze_predictions(frame_root: Path,
             if image.shape[:2] != gt_mask.shape[:2]:
                 image = np.array(Image.fromarray(image).resize((gt_mask.shape[1], gt_mask.shape[0]), resample=Image.BILINEAR))
 
+            if metrics["pixel_accuracy"] is None:
+                continue
             ignore_index = dataset_config.ignore_index
             valid_mask = np.ones_like(gt_mask, dtype=bool)
             if ignore_index is not None:
@@ -487,20 +622,6 @@ def analyze_predictions(frame_root: Path,
             if valid_pixels == 0:
                 continue
 
-            labels = sorted(set(np.unique(pred_mask[valid_mask]).tolist()) | set(np.unique(gt_mask[valid_mask]).tolist()))
-            iou_scores, dice_scores = _collect_label_metrics(pred_mask, gt_mask, labels, valid_mask)
-            macro_iou = float(np.mean(list(iou_scores.values()))) if iou_scores else 0.0
-            macro_dice = float(np.mean(list(dice_scores.values()))) if dice_scores else 0.0
-            pixel_accuracy = float((pred_mask[valid_mask] == gt_mask[valid_mask]).mean())
-            error_pixels = int(np.logical_and(pred_mask != gt_mask, valid_mask).sum())
-            error_rate = float(error_pixels / valid_pixels)
-            false_positive_pixels, false_negative_pixels, class_confusion_pixels = _error_breakdown(
-                pred_mask=pred_mask,
-                gt_mask=gt_mask,
-                valid_mask=valid_mask,
-                background_index=dataset_config.background_index,
-            )
-
             temporal_iou_prev = ""
             if prev_pred_mask is not None:
                 temporal_intersection = np.logical_and(prev_pred_mask == pred_mask, valid_mask).sum()
@@ -508,9 +629,16 @@ def analyze_predictions(frame_root: Path,
                 temporal_iou_prev = float(temporal_intersection / temporal_union) if temporal_union > 0 else ""
             prev_pred_mask = pred_mask.copy()
 
-            pred_classes = sorted(np.unique(pred_mask[valid_mask]).tolist())
-            gt_classes = sorted(np.unique(gt_mask[valid_mask]).tolist())
+            pred_classes = metrics["pred_classes"]
+            gt_classes = metrics["gt_classes"]
             pred_rgb = _colorize_mask(pred_mask, dataset_config.palette, dataset_config.ignore_index)
+            pred_pattern_rgb = _apply_confidence_pattern(
+                pred_mask=pred_mask,
+                pred_rgb=pred_rgb,
+                confidence_map=confidence_map,
+                background_index=dataset_config.background_index,
+                ignore_index=dataset_config.ignore_index,
+            )
             gt_rgb = _colorize_mask(gt_mask, dataset_config.palette, dataset_config.ignore_index)
             mask_backdrop = gt_rgb.copy()
             error_map = _build_error_map(pred_mask, gt_mask, valid_mask, dataset_config.background_index)
@@ -564,6 +692,7 @@ def analyze_predictions(frame_root: Path,
             artifact_dir = output_root / "artifacts" / video_name
             artifact_dir.mkdir(parents=True, exist_ok=True)
             pred_artifact_path = artifact_dir / f"{frame_name}_pred_rgb.png"
+            pred_pattern_artifact_path = artifact_dir / f"{frame_name}_pred_confidence_pattern.png"
             gt_artifact_path = artifact_dir / f"{frame_name}_gt_rgb.png"
             error_artifact_path = artifact_dir / f"{frame_name}_error_map.png"
             error_mask_artifact_path = artifact_dir / f"{frame_name}_error_map_mask.png"
@@ -573,6 +702,7 @@ def analyze_predictions(frame_root: Path,
 
             Image.fromarray(image).save(image_artifact_path)
             Image.fromarray(pred_rgb).save(pred_artifact_path)
+            Image.fromarray(pred_pattern_rgb).save(pred_pattern_artifact_path)
             Image.fromarray(gt_rgb).save(gt_artifact_path)
             Image.fromarray(error_map_annotated).save(error_artifact_path)
             Image.fromarray(error_map_mask_annotated).save(error_mask_artifact_path)
@@ -606,21 +736,21 @@ def analyze_predictions(frame_root: Path,
                 "gt_mask_path": str(gt_path),
                 "confidence_path": confidence_artifact_path,
                 "artifact_dir": str(artifact_dir),
-                "pixel_accuracy": pixel_accuracy,
-                "macro_iou": macro_iou,
-                "macro_dice": macro_dice,
-                "error_pixels": error_pixels,
-                "error_rate": error_rate,
-                "false_positive_pixels": false_positive_pixels,
-                "false_negative_pixels": false_negative_pixels,
-                "class_confusion_pixels": class_confusion_pixels,
+                "pixel_accuracy": metrics["pixel_accuracy"],
+                "macro_iou": metrics["macro_iou"],
+                "macro_dice": metrics["macro_dice"],
+                "error_pixels": metrics["error_pixels"],
+                "error_rate": metrics["error_rate"],
+                "false_positive_pixels": metrics["false_positive_pixels"],
+                "false_negative_pixels": metrics["false_negative_pixels"],
+                "class_confusion_pixels": metrics["class_confusion_pixels"],
                 "temporal_iou_prev": temporal_iou_prev,
                 "num_pred_classes": len(pred_classes),
                 "num_gt_classes": len(gt_classes),
                 "pred_classes": json.dumps(pred_classes),
                 "gt_classes": json.dumps(gt_classes),
-                "per_class_iou": json.dumps(iou_scores),
-                "per_class_dice": json.dumps(dice_scores),
+                "per_class_iou": json.dumps(metrics["per_class_iou"]),
+                "per_class_dice": json.dumps(metrics["per_class_dice"]),
                 **confidence_stats,
             })
             summary["videos"][video_name]["frames"] += 1

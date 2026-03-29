@@ -67,6 +67,7 @@ For each analyzed frame, the report saves:
 
 - `<frame>_image.png`
 - `<frame>_pred_rgb.png`
+- `<frame>_pred_confidence_pattern.png` for the prediction mask with disagreement-style confidence striping
 - `<frame>_gt_rgb.png`
 - `<frame>_error_map.png` for the image-backed error view
 - `<frame>_error_map_mask.png` for the RGB-mask-backed error view

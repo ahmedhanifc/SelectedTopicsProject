@@ -848,6 +848,7 @@ class SAM2VideoPredictor(SAM2Base):
     def reset_state(self, inference_state):
         """Remove all input points or mask in all frames throughout the video."""
         self._reset_tracking_results(inference_state)
+        inference_state["cached_features"].clear()
         # Remove all object ids
         inference_state["obj_id_to_idx"].clear()
         inference_state["obj_idx_to_id"].clear()

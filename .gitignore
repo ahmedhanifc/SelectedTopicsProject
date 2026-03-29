@@ -2,6 +2,9 @@ data/
 dataset/
 frame_root/
 output_masks/
+output_masks_*/
+analysis_output/
+analysis_output_*/
 checkpoints/
 src/sam2/checkpoints
 src/sam2/sam2/checkpoints/
@@ -9,6 +12,7 @@ SDS_Playground/
 google_drive_upload/
 src/sam2/eval_sasvi_live_maskrcnn_nnunet.py
 src/sam2/eval_sasvi_old.py
+.DS_Store
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -173,6 +177,8 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 
 .idea/
+.vscode/
+.ruff_cache/
 results/
 tmp/
 *_weights.pth

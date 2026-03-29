@@ -2,25 +2,96 @@
 #TODO: Prediction on reverse direction when overseer prediction confidence is high
 #TODO: Fine-tune SAM2 on the dataset
 
-import os
-import cv2
-import sys
-import time
-import numpy as np
-import torch
 import argparse
 import itertools
+import os
+import sys
+import tempfile
+import time
+
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "mpl"))
+os.environ.setdefault("XDG_CACHE_HOME", tempfile.gettempdir())
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
+import cv2
+import numpy as np
+import torch
 from PIL import Image
 import matplotlib.pyplot as plt
 from skimage.transform import resize
+from skimage import measure
 from scipy.ndimage import find_objects
+from scipy.spatial.distance import cdist
 import albumentations as A
 import torchvision.transforms as T
 from transformers import DetrImageProcessor, DetrForSegmentation, Mask2FormerForUniversalSegmentation, Mask2FormerImageProcessor
 
-from sds_playground.datasets.cholecseg8k.cholecseg8k_visualisation import get_cholecseg8k_colormap
-from sds_playground.datasets.cadisv2.cadisv2_visualisation import get_cadis_colormap
-from sds_playground.datasets.cataract1k.cataract1ksegm_visualisation import get_cataract1k_colormap
+try:
+    from sds_playground.datasets.cholecseg8k.cholecseg8k_visualisation import get_cholecseg8k_colormap
+    from sds_playground.datasets.cadisv2.cadisv2_visualisation import get_cadis_colormap
+    from sds_playground.datasets.cataract1k.cataract1ksegm_visualisation import get_cataract1k_colormap
+except ModuleNotFoundError:
+    def _fallback_colormap(num_classes, dataset_type=None):
+        if dataset_type == "CHOLECSEG8K":
+            base_colors = np.array([
+                [127, 127, 127],
+                [255, 114, 114],
+                [255, 160, 165],
+                [186, 183, 75],
+                [231, 70, 156],
+                [210, 140, 140],
+                [255, 255, 255],
+                [255, 184, 138],
+                [208, 168, 255],
+                [129, 204, 184],
+                [255, 214, 102],
+                [145, 198, 255],
+                [244, 143, 177],
+            ], dtype=np.uint8)
+        else:
+            base_colors = np.array([
+                [0, 0, 0],
+                [230, 25, 75],
+                [60, 180, 75],
+                [255, 225, 25],
+                [0, 130, 200],
+                [245, 130, 48],
+                [145, 30, 180],
+                [70, 240, 240],
+                [240, 50, 230],
+                [210, 245, 60],
+                [250, 190, 190],
+                [0, 128, 128],
+                [230, 190, 255],
+                [170, 110, 40],
+                [255, 250, 200],
+                [128, 0, 0],
+                [170, 255, 195],
+                [128, 128, 0],
+                [255, 215, 180],
+                [0, 0, 128],
+            ], dtype=np.uint8)
+
+        if num_classes <= len(base_colors):
+            return base_colors[:num_classes]
+
+        extra = []
+        for idx in range(len(base_colors), num_classes):
+            extra.append([(37 * idx) % 256, (97 * idx) % 256, (17 * idx) % 256])
+        return np.vstack([base_colors, np.array(extra, dtype=np.uint8)])
+
+    def get_cholecseg8k_colormap():
+        return _fallback_colormap(13, dataset_type="CHOLECSEG8K")
+
+    def get_cadis_colormap():
+        return _fallback_colormap(18)
+
+    def get_cataract1k_colormap():
+        return _fallback_colormap(14)
 
 # from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 # from nnunetv2.imageio.natural_image_reader_writer import NaturalImage2DIO
@@ -33,11 +104,33 @@ from analysis_tools.inference_export import (
     save_confidence_map,
     summarise_confidence_map,
     write_rows_to_csv,
+    write_markdown_report,
 )
+from analysis_tools.config import get_dataset_config
+from analysis_tools.error_analysis import compute_frame_metrics, load_dataset_mask
+
+
+def configure_cpu_runtime():
+    cv2.setNumThreads(1)
+    try:
+        cv2.ocl.setUseOpenCL(False)
+    except AttributeError:
+        pass
+
+    cpu_threads = max(1, min(4, os.cpu_count() or 1))
+    torch.set_num_threads(cpu_threads)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
 from src.sam2_utils import kmeans_sampling
 from src.data import remap_labels, insert_component_masks
 from src.utils import process_detr_outputs, process_mask2former_outputs
 from src.model import get_model_instance_segmentation
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
+
 
 def flatten(lst):
     for item in lst:
@@ -177,6 +270,269 @@ def get_points_from_mask(mask, label_ids=None, num_points=20):
     return prompt_points
 
 
+def infer_frame_sort_key(stem):
+    if stem.startswith("frame_"):
+        stem = stem[6:]
+    digits = "".join(ch for ch in stem if ch.isdigit())
+    if digits:
+        return int(digits)
+    raise ValueError(f"Unable to parse frame index from '{stem}'")
+
+
+def list_video_frames(video_dir):
+    frame_infos = []
+    for filename in os.listdir(video_dir):
+        stem, ext = os.path.splitext(filename)
+        if ext not in IMAGE_EXTENSIONS:
+            continue
+        if "_mask" in stem:
+            continue
+        frame_infos.append({
+            "stem": stem,
+            "ext": ext,
+            "path": os.path.join(video_dir, filename),
+        })
+
+    frame_infos.sort(key=lambda item: infer_frame_sort_key(item["stem"]))
+    return frame_infos
+
+
+def discover_video_dirs(base_video_dir):
+    discovered = []
+    for entry in sorted(os.listdir(base_video_dir)):
+        entry_path = os.path.join(base_video_dir, entry)
+        if not os.path.isdir(entry_path):
+            continue
+
+        if list_video_frames(entry_path):
+            discovered.append((entry, entry_path))
+            continue
+
+        for child in sorted(os.listdir(entry_path)):
+            child_path = os.path.join(entry_path, child)
+            if os.path.isdir(child_path) and list_video_frames(child_path):
+                discovered.append((child, child_path))
+    return discovered
+
+
+def build_frame_subset_dir(video_name, frame_infos, output_root=None):
+    if output_root is not None:
+        os.makedirs(output_root, exist_ok=True)
+    subset_root = tempfile.mkdtemp(prefix=f"sasvi_{video_name}_", dir=output_root)
+    subset_dir = os.path.join(subset_root, video_name)
+    os.makedirs(subset_dir, exist_ok=True)
+    for frame_info in frame_infos:
+        dst_path = os.path.join(subset_dir, f"{frame_info['stem']}{frame_info['ext']}")
+        os.symlink(os.path.abspath(frame_info["path"]), dst_path)
+    return subset_root, subset_dir
+
+
+GT_MASK_SUFFIX_CANDIDATES = (
+    "_watershed_mask.png",
+    "_color_mask.png",
+    "_mask.png",
+)
+
+
+def resolve_gt_mask_path(frame_name, video_dir, video_name, base_video_dir, gt_root_dir=None):
+    candidate_roots = []
+    if gt_root_dir is not None:
+        relative_video_dir = os.path.relpath(video_dir, start=base_video_dir)
+        candidate_roots.append(os.path.join(gt_root_dir, relative_video_dir))
+        candidate_roots.append(os.path.join(gt_root_dir, video_name))
+    candidate_roots.append(video_dir)
+
+    seen_paths = set()
+    for root in candidate_roots:
+        for suffix in GT_MASK_SUFFIX_CANDIDATES:
+            candidate = os.path.abspath(os.path.join(root, f"{frame_name}{suffix}"))
+            if candidate in seen_paths:
+                continue
+            seen_paths.add(candidate)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def ensure_cached_overseer_prediction(cache, frame_idx, frame_names, frame_path_by_name, overseer_model, reshape_size):
+    if frame_idx not in cache:
+        frame_name = frame_names[frame_idx]
+        cache[frame_idx] = overseer_model.get_prediction(
+            [frame_path_by_name[frame_name]],
+            reshape_size=reshape_size,
+        )
+    return cache[frame_idx]
+
+
+def per_obj_mask_to_label_map(per_obj_mask, height, width, shift_by_1):
+    if not per_obj_mask:
+        fill_value = 255 if shift_by_1 else 0
+        return np.full((height, width), fill_value, dtype=np.uint8)
+    return put_per_obj_mask(per_obj_mask, height, width, shift_by_1)
+
+
+def per_obj_mask_to_foreground(per_obj_mask, height, width):
+    foreground = np.zeros((height, width), dtype=bool)
+    for object_mask in per_obj_mask.values():
+        foreground |= np.asarray(object_mask, dtype=bool).reshape(height, width)
+    return foreground
+
+
+def compute_binary_iou(mask_a, mask_b):
+    intersection = np.logical_and(mask_a, mask_b).sum()
+    union = np.logical_or(mask_a, mask_b).sum()
+    if union == 0:
+        return 1.0
+    return float(intersection / union)
+
+
+def compute_classwise_iou(per_obj_mask_a, per_obj_mask_b, height, width):
+    labels = sorted(set(per_obj_mask_a) | set(per_obj_mask_b))
+    if not labels:
+        return 1.0, {}
+
+    per_class_iou = {}
+    empty_mask = np.zeros((height, width), dtype=bool)
+    for label in labels:
+        mask_a = np.asarray(per_obj_mask_a.get(label, empty_mask), dtype=bool).reshape(height, width)
+        mask_b = np.asarray(per_obj_mask_b.get(label, empty_mask), dtype=bool).reshape(height, width)
+        per_class_iou[label] = compute_binary_iou(mask_a, mask_b)
+
+    mean_iou = float(np.mean(list(per_class_iou.values())))
+    return mean_iou, per_class_iou
+
+
+def compute_boundary_distance(mask_a, mask_b):
+    mask_a = np.asarray(mask_a, dtype=np.uint8)
+    mask_b = np.asarray(mask_b, dtype=np.uint8)
+    if mask_a.sum() == 0 and mask_b.sum() == 0:
+        return 0.0
+    if mask_a.sum() == 0 or mask_b.sum() == 0:
+        return float("inf")
+
+    contours_a = measure.find_contours(mask_a, level=0.5)
+    contours_b = measure.find_contours(mask_b, level=0.5)
+    if not contours_a and not contours_b:
+        return 0.0
+    if not contours_a or not contours_b:
+        return float("inf")
+
+    points_a = np.concatenate(contours_a, axis=0)
+    points_b = np.concatenate(contours_b, axis=0)
+    distances = cdist(points_a, points_b)
+    symmetric_distance = 0.5 * (
+        distances.min(axis=1).mean() + distances.min(axis=0).mean()
+    )
+    return float(symmetric_distance)
+
+
+def compute_disagreement_metrics(per_obj_sam_mask, per_obj_overseer_mask, height, width):
+    mean_iou, per_class_iou = compute_classwise_iou(
+        per_obj_mask_a=per_obj_sam_mask,
+        per_obj_mask_b=per_obj_overseer_mask,
+        height=height,
+        width=width,
+    )
+    sam_foreground = per_obj_mask_to_foreground(per_obj_sam_mask, height, width)
+    overseer_foreground = per_obj_mask_to_foreground(per_obj_overseer_mask, height, width)
+    foreground_iou = compute_binary_iou(sam_foreground, overseer_foreground)
+    return {
+        "iou": mean_iou,
+        "foreground_iou": foreground_iou,
+        "per_class_iou": per_class_iou,
+        "sam_foreground": sam_foreground,
+        "overseer_foreground": overseer_foreground,
+    }
+
+
+def save_disagreement_visual(path, frame_path, sam_foreground, overseer_foreground):
+    frame = np.array(Image.open(frame_path).convert("RGB"))
+    sam_only = np.logical_and(sam_foreground, ~overseer_foreground)
+    overseer_only = np.logical_and(overseer_foreground, ~sam_foreground)
+    overlap = np.logical_and(sam_foreground, overseer_foreground)
+
+    overlay = frame.copy()
+    overlay[sam_only] = np.array([255, 0, 0], dtype=np.uint8)
+    overlay[overseer_only] = np.array([0, 255, 0], dtype=np.uint8)
+    overlay[overlap] = np.array([255, 255, 0], dtype=np.uint8)
+
+    Image.fromarray(overlay).save(path)
+
+
+def get_primary_visual_palette(num_classes):
+    base_colors = np.array([
+        [127, 127, 127],  # background
+        [255, 0, 0],      # red
+        [0, 0, 255],      # blue
+        [0, 200, 0],      # green
+        [255, 255, 0],    # yellow
+        [255, 0, 255],    # magenta
+        [0, 255, 255],    # cyan
+        [255, 128, 0],    # orange
+        [128, 0, 255],    # violet
+        [139, 69, 19],    # brown
+        [255, 255, 255],  # white
+        [0, 0, 0],        # black
+        [0, 128, 128],    # teal
+        [128, 128, 0],    # olive
+        [128, 0, 0],      # maroon
+        [0, 128, 0],      # dark green
+        [0, 128, 255],    # azure
+        [255, 0, 128],    # rose
+        [64, 64, 255],    # strong periwinkle
+        [0, 180, 120],    # sea green
+    ], dtype=np.uint8)
+    if num_classes <= len(base_colors):
+        return base_colors[:num_classes]
+    extra = []
+    for idx in range(len(base_colors), num_classes):
+        extra.append([(53 * idx) % 256, (97 * idx) % 256, (193 * idx) % 256])
+    return np.vstack([base_colors, np.array(extra, dtype=np.uint8)])
+
+
+def smooth_label_map(label_map, fill_value):
+    smoothed = np.full(label_map.shape, fill_value, dtype=np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    labels = [label for label in np.unique(label_map).tolist() if label != fill_value]
+    for label in labels:
+        binary = (label_map == label).astype(np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        smoothed[binary.astype(bool)] = label
+    return smoothed
+
+
+def export_mask_variants(
+    output_mask_dir,
+    video_name,
+    frame_name,
+    raw_mask,
+    smoothed_mask,
+    output_palette,
+):
+    variant_masks = {
+        "raw": raw_mask,
+        "smoothed": smoothed_mask,
+    }
+    for variant_name, variant_mask in variant_masks.items():
+        variant_dir = os.path.join(output_mask_dir, variant_name, video_name)
+        os.makedirs(variant_dir, exist_ok=True)
+        save_ann_png(
+            os.path.join(variant_dir, f"{frame_name}_rgb_mask.png"),
+            variant_mask,
+            output_palette,
+        )
+
+
+def label_map_to_binary_stack(label_map, num_classes, shift_by_1):
+    binary_stack = np.zeros((num_classes, *label_map.shape), dtype=bool)
+    for class_idx in range(num_classes):
+        binary_stack[class_idx] = label_map == class_idx
+    if shift_by_1:
+        binary_stack[-1] |= label_map == 255
+    return binary_stack
+
+
 def save_masks_to_dir(
     output_mask_dir,
     video_name,
@@ -189,20 +545,24 @@ def save_masks_to_dir(
     num_classes,
     shift_by_1,
     vis_mode=False,
-    save_height=299,
-    save_width=299,
 ):
     """Save masks to a directory as PNG files."""
-    os.makedirs(os.path.join(output_mask_dir, video_name), exist_ok=True)
     per_obj_output_mask = {
         key: np.expand_dims(value, axis=0) if value.ndim == 2 else value
         for key, value in per_obj_output_mask.items()
     }
-    output_mask = put_per_obj_mask(per_obj_output_mask, height, width, shift_by_1)
-    output_mask_path = os.path.join(
-        output_mask_dir, video_name, f"{frame_name}_rgb_mask.png"
+    raw_output_mask = put_per_obj_mask(per_obj_output_mask, height, width, shift_by_1)
+    fill_value = 255 if shift_by_1 else 0
+    smoothed_output_mask = smooth_label_map(raw_output_mask, fill_value=fill_value)
+
+    export_mask_variants(
+        output_mask_dir=output_mask_dir,
+        video_name=video_name,
+        frame_name=frame_name,
+        raw_mask=raw_output_mask,
+        smoothed_mask=smoothed_output_mask,
+        output_palette=output_palette,
     )
-    save_ann_png(output_mask_path, output_mask, output_palette, reshape_size=(save_width, save_height))
 
     if save_binary_mask:
         for i in range(num_classes):
@@ -217,10 +577,14 @@ def save_masks_to_dir(
         else:
             output_mask[0] |= ~output_mask[1:].any(axis=0)
 
-        reshape_size = (save_height, save_width)
-        output_mask = np.array([resize(mask, reshape_size, order=0, preserve_range=True, anti_aliasing=False).astype(bool) for mask in output_mask])
-        output_mask_path = os.path.join(output_mask_dir, video_name, f"{frame_name}_binary_mask.npz")
-        np.savez_compressed(file=output_mask_path, arr=output_mask)
+        raw_binary_dir = os.path.join(output_mask_dir, "raw", video_name)
+        smoothed_binary_dir = os.path.join(output_mask_dir, "smoothed", video_name)
+        os.makedirs(raw_binary_dir, exist_ok=True)
+        os.makedirs(smoothed_binary_dir, exist_ok=True)
+        raw_binary = label_map_to_binary_stack(raw_output_mask, num_classes, shift_by_1)
+        smoothed_binary = label_map_to_binary_stack(smoothed_output_mask, num_classes, shift_by_1)
+        np.savez_compressed(file=os.path.join(raw_binary_dir, f"{frame_name}_binary_mask.npz"), arr=raw_binary)
+        np.savez_compressed(file=os.path.join(smoothed_binary_dir, f"{frame_name}_binary_mask.npz"), arr=smoothed_binary)
 
         if vis_mode:
             rows, cols = 4, 4  # Adjust based on the number of masks
@@ -235,7 +599,7 @@ def save_masks_to_dir(
                 fig.delaxes(axes[i])
             plt.tight_layout()
             plt.axis('off')
-            plt.savefig(os.path.join(output_mask_dir, video_name, f"{frame_name}_visualization.jpg"), bbox_inches='tight', pad_inches=0.1)
+            plt.savefig(os.path.join(output_mask_dir, "raw", video_name, f"{frame_name}_visualization.jpg"), bbox_inches='tight', pad_inches=0.1)
             plt.close()
 
 
@@ -501,7 +865,6 @@ def sasvi_inference(
     base_video_dir,
     output_mask_dir,
     video_name,
-    
     overseer_type,
     overseer_mask_dir,
     overseer_model,
@@ -512,29 +875,63 @@ def sasvi_inference(
     shift_by_1,
     palette,
     dataset_type,
+    gt_dataset_config,
+    video_dir=None,
+    gt_root_dir=None,
+    start_frame=None,
+    end_frame=None,
+    frame_name=None,
 
     score_thresh=0.0,
     save_binary_mask=False,
     analysis_output_dir=None,
+    enable_disagreement_gate=False,
+    disagreement_iou_threshold=0.5,
+    disagreement_bad_frames=2,
+    enable_boundary_distance_gate=False,
+    boundary_distance_threshold=20.0,
+    save_disagreement_visuals=False,
+    max_disagreement_visuals=10,
 ):
     """Run inference on a single video with the given predictor."""
-    video_dir = os.path.join(base_video_dir, video_name)
-    frame_names = [
-        os.path.splitext(p)[0]
-        for p in os.listdir(video_dir)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-    ]
+    video_dir = video_dir or os.path.join(base_video_dir, video_name)
+    frame_infos = list_video_frames(video_dir)
+    if not frame_infos:
+        raise RuntimeError(f"No input frames found in {video_dir}")
 
-    if dataset_type == "CADIS":
-        frame_names.sort(key=lambda p: int(os.path.splitext(p)[0][5:]))
-    else:
-        frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+    if frame_name is not None:
+        frame_infos = [info for info in frame_infos if info["stem"] == frame_name]
+        if not frame_infos:
+            raise RuntimeError(f"Frame '{frame_name}' not found in {video_dir}")
+
+    if start_frame is not None:
+        frame_infos = [info for info in frame_infos if infer_frame_sort_key(info["stem"]) >= start_frame]
+    if end_frame is not None:
+        frame_infos = [info for info in frame_infos if infer_frame_sort_key(info["stem"]) <= end_frame]
+    if not frame_infos:
+        raise RuntimeError(f"No frames left to process for {video_name} after filtering.")
+
+    frame_names = [info["stem"] for info in frame_infos]
+    frame_path_by_name = {info["stem"]: info["path"] for info in frame_infos}
+    predictor_video_dir = video_dir
+    temp_subset_root = None
+    subset_mode = (
+        frame_name is not None
+        or start_frame is not None
+        or end_frame is not None
+    )
+    if subset_mode:
+        temp_subset_root, predictor_video_dir = build_frame_subset_dir(
+            video_name=video_name,
+            frame_infos=frame_infos,
+            output_root=analysis_output_dir,
+        )
 
     per_obj_input_mask_cached = {}
     
     # load the video frames and initialize the inference state of SAM2 on this video
     inference_state = predictor.init_state(
-        video_path=video_dir,
+        video_path=predictor_video_dir,
         offload_video_to_cpu=True,
         offload_state_to_cpu=True,
         async_loading_frames=True
@@ -544,17 +941,54 @@ def sasvi_inference(
     break_endless_loop = False
     inference_rows = {}
     confidence_dir = None
+    disagreement_visual_dir = None
     if analysis_output_dir is not None:
         confidence_dir = os.path.join(analysis_output_dir, "inference", "confidence_maps", video_name)
         os.makedirs(confidence_dir, exist_ok=True)
+        if save_disagreement_visuals:
+            disagreement_visual_dir = os.path.join(
+                analysis_output_dir, "inference", "disagreement_visuals", video_name
+            )
+            os.makedirs(disagreement_visual_dir, exist_ok=True)
 
-    # run propagation throughout the video and collect the results in a dict
-    os.makedirs(os.path.join(output_mask_dir, video_name), exist_ok=True)
+    raw_output_mask_dir = os.path.join(output_mask_dir, "raw")
+    smoothed_output_mask_dir = os.path.join(output_mask_dir, "smoothed")
+    os.makedirs(os.path.join(raw_output_mask_dir, video_name), exist_ok=True)
+    os.makedirs(os.path.join(smoothed_output_mask_dir, video_name), exist_ok=True)
 
+    trace_rows = []
+    video_summary = {
+        "video_name": video_name,
+        "frames_processed": 0,
+        "segments_started": 0,
+        "class_change_reprompts": 0,
+        "disagreement_reprompts": 0,
+        "mean_iou": 1.0,
+        "min_iou": 1.0,
+        "gt_frames_evaluated": 0,
+        "gt_macro_iou_mean": None,
+        "gt_macro_dice_mean": None,
+        "gt_pixel_accuracy_mean": None,
+    }
+    per_frame_ious = []
+    gt_macro_ious = []
+    gt_macro_dices = []
+    gt_pixel_accuracies = []
+    prompt_label_list = []
+    negative_duplicate_list = []
+    old_label = []
+    current_label = []
+    break_endless_loop = False
+    disagreement_visual_count = 0
     idx = 0
     while idx < len(frame_names):
+        segment_id = video_summary["segments_started"] + 1
+        video_summary["segments_started"] += 1
+        segment_start_idx = idx
+        disagreement_counter = 0
+
         # clear the prompts from previous runs
-        print("New inference for segment: " + frame_names[idx])
+        print(f"[segment] video={video_name} segment={segment_id} start_frame={frame_names[idx]} idx={idx}")
         predictor.reset_state(inference_state=inference_state)
         buffer_length = 25
 
@@ -565,18 +999,21 @@ def sasvi_inference(
             del per_obj_input_mask_cached[smallest_idx]
 
         # this loads the masks. will add those input masks to SAM 2 inference state before propagations
-        if per_obj_input_mask_cached.get(idx) is not None:
-            per_obj_input_mask = per_obj_input_mask_cached.get(idx)
-        else: 
-            per_obj_input_mask = overseer_model.get_prediction([os.path.join(video_dir, f"{frame_names[idx]}.jpg")], reshape_size=(height, width))
-            per_obj_input_mask_cached[idx] = per_obj_input_mask
+        per_obj_input_mask = ensure_cached_overseer_prediction(
+            cache=per_obj_input_mask_cached,
+            frame_idx=idx,
+            frame_names=frame_names,
+            frame_path_by_name=frame_path_by_name,
+            overseer_model=overseer_model,
+            reshape_size=(height, width),
+        )
 
         if idx > 0:
             # to make it more stable, if something ignored in overseer frame, but detected in previous sam2 frame, add it to the prompt mask
             # but didnt work for cat1k and cholec80 bcs it slowly covers the background which should have no label
             if dataset_type == "CADIS":
                 per_obj_previous_mask = get_per_obj_mask(
-                                            mask_path=os.path.join(output_mask_dir, video_name), 
+                                            mask_path=os.path.join(raw_output_mask_dir, video_name), 
                                             frame_name=frame_names[idx],
                                             use_binary_mask=False, 
                                             width=width, 
@@ -621,6 +1058,9 @@ def sasvi_inference(
             break_endless_loop = True
             negative_duplicate_list = [x for xs in negative_duplicate_list for x in xs]
             old_label = list((((set(old_label) & set(current_label)) | set(prompt_label_list)) - set(negative_duplicate_list)))
+        else:
+            yet_another_unique_label = []
+            negative_duplicate_list = []
 
         # add the corrected mask to predictor
         for object_id, object_mask in per_obj_input_mask.items():
@@ -643,11 +1083,34 @@ def sasvi_inference(
                 mask=dummy_mask,
             )
 
+        trigger_next_idx = None
         for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state): 
+            idx = out_frame_idx
             per_obj_output_mask = {
                 out_obj_id: (out_mask_logits[i] > score_thresh).cpu().numpy()
                 for i, out_obj_id in enumerate(out_obj_ids)
             }
+            current_overseer_mask = ensure_cached_overseer_prediction(
+                cache=per_obj_input_mask_cached,
+                frame_idx=out_frame_idx,
+                frame_names=frame_names,
+                frame_path_by_name=frame_path_by_name,
+                overseer_model=overseer_model,
+                reshape_size=(height, width),
+            )
+            disagreement_metrics = compute_disagreement_metrics(
+                per_obj_sam_mask=per_obj_output_mask,
+                per_obj_overseer_mask=current_overseer_mask,
+                height=height,
+                width=width,
+            )
+            boundary_distance = None
+            if enable_boundary_distance_gate:
+                boundary_distance = compute_boundary_distance(
+                    disagreement_metrics["sam_foreground"],
+                    disagreement_metrics["overseer_foreground"],
+                )
+
             if confidence_dir is not None and len(out_obj_ids) > 0:
                 confidence_map = compute_confidence_map(
                     out_mask_logits,
@@ -664,9 +1127,23 @@ def sasvi_inference(
                     "video_name": video_name,
                     "frame_name": frame_names[out_frame_idx],
                     "frame_idx": out_frame_idx,
+                    "segment_id": segment_id,
                     "num_objects": len(out_obj_ids),
                     "confidence_path": confidence_path,
                     **confidence_stats,
+                }
+            else:
+                inference_rows[frame_names[out_frame_idx]] = {
+                    "video_name": video_name,
+                    "frame_name": frame_names[out_frame_idx],
+                    "frame_idx": out_frame_idx,
+                    "segment_id": segment_id,
+                    "num_objects": len(out_obj_ids),
+                    "confidence_path": None,
+                    "confidence_mean": None,
+                    "confidence_std": None,
+                    "confidence_min": None,
+                    "confidence_max": None,
                 }
             # write the output masks as palette PNG files to output_mask_dir
             save_masks_to_dir(
@@ -687,7 +1164,7 @@ def sasvi_inference(
                     output_mask_dir=overseer_mask_dir,
                     video_name=video_name,
                     frame_name=frame_names[out_frame_idx],
-                    per_obj_output_mask=per_obj_input_mask_cached[out_frame_idx],
+                    per_obj_output_mask=current_overseer_mask,
                     height=height,
                     width=width,
                     output_palette=palette,
@@ -696,21 +1173,84 @@ def sasvi_inference(
                     shift_by_1=shift_by_1,
                 )
 
+            gt_mask_path = resolve_gt_mask_path(
+                frame_name=frame_names[out_frame_idx],
+                video_dir=video_dir,
+                video_name=video_name,
+                base_video_dir=base_video_dir,
+                gt_root_dir=gt_root_dir,
+            )
+            gt_metrics = {
+                "gt_mask_path": gt_mask_path,
+                "gt_pixel_accuracy": None,
+                "gt_macro_iou": None,
+                "gt_macro_dice": None,
+                "gt_error_rate": None,
+            }
+            if gt_mask_path is not None:
+                pred_label_map = per_obj_mask_to_label_map(
+                    per_obj_mask=per_obj_output_mask,
+                    height=height,
+                    width=width,
+                    shift_by_1=shift_by_1,
+                )
+                gt_label_map = load_dataset_mask(gt_mask_path, gt_dataset_config)
+                gt_frame_metrics = compute_frame_metrics(
+                    pred_mask=pred_label_map,
+                    gt_mask=gt_label_map,
+                    dataset_config=gt_dataset_config,
+                )
+                if gt_frame_metrics["macro_iou"] is not None:
+                    gt_metrics = {
+                        "gt_mask_path": gt_mask_path,
+                        "gt_pixel_accuracy": gt_frame_metrics["pixel_accuracy"],
+                        "gt_macro_iou": gt_frame_metrics["macro_iou"],
+                        "gt_macro_dice": gt_frame_metrics["macro_dice"],
+                        "gt_error_rate": gt_frame_metrics["error_rate"],
+                    }
+                    gt_macro_ious.append(gt_frame_metrics["macro_iou"])
+                    gt_macro_dices.append(gt_frame_metrics["macro_dice"])
+                    gt_pixel_accuracies.append(gt_frame_metrics["pixel_accuracy"])
+                    video_summary["gt_frames_evaluated"] += 1
+
+            bad_disagreement_frame = False
+            if enable_disagreement_gate and out_frame_idx > segment_start_idx:
+                bad_disagreement_frame = disagreement_metrics["iou"] < disagreement_iou_threshold
+                if enable_boundary_distance_gate and boundary_distance is not None:
+                    bad_disagreement_frame = (
+                        bad_disagreement_frame
+                        or boundary_distance > boundary_distance_threshold
+                    )
+                disagreement_counter = disagreement_counter + 1 if bad_disagreement_frame else 0
+            else:
+                disagreement_counter = 0
+
+            video_summary["frames_processed"] += 1
+            per_frame_ious.append(disagreement_metrics["iou"])
+
             future_n_frame = min(10, len(frame_names) - idx)
             per_obj_input_mask_n = []
             duplicate_list = []
             negative_duplicate_list = []
             partial_duplicate_list = []
             prompt_label_list = []
+            class_change_trigger = False
+            disagreement_trigger = False
+            reprompt_executed = False
+            reprompt_reason = ""
 
             # getting overseer prediction and caching them for future use
             for n in range(future_n_frame):
-                if per_obj_input_mask_cached.get(idx+n) is not None:
-                    per_obj_input_mask_n.append(per_obj_input_mask_cached.get(idx+n))
-                else:
-                    temp = overseer_model.get_prediction([os.path.join(video_dir, f"{frame_names[idx+n]}.jpg")], reshape_size=(height, width))
-                    per_obj_input_mask_n.append(temp)
-                    per_obj_input_mask_cached[idx+n] = temp
+                per_obj_input_mask_n.append(
+                    ensure_cached_overseer_prediction(
+                        cache=per_obj_input_mask_cached,
+                        frame_idx=idx + n,
+                        frame_names=frame_names,
+                        frame_path_by_name=frame_path_by_name,
+                        overseer_model=overseer_model,
+                        reshape_size=(height, width),
+                    )
+                )
 
             # getting separate unique labels for each frame in per_obj_input_mask_n
             unique_lable_n = get_unique_label(per_obj_input_mask_n)
@@ -722,6 +1262,7 @@ def sasvi_inference(
                 # to restart the inference after 50 frames to avoid false labels to continue longer
                 buffer_length -= 1                    
                 if buffer_length == 0:
+                    trigger_next_idx = min(idx + 1, len(frame_names))
                     break
                 
                 if old_label != current_label:
@@ -776,7 +1317,7 @@ def sasvi_inference(
                                 prompt_label = max(selections, key=selections.get)
                                 # use nnunet almost in ensembling fashion for error propagation
                                 if use_nnunet and nnunet_model is not None:
-                                    per_obj_input_mask_nnunet = nnunet_model.get_prediction(os.path.join(video_dir, f"{frame_names[idx]}.jpg"), reshape_size=(width, height))
+                                    per_obj_input_mask_nnunet = nnunet_model.get_prediction(frame_path_by_name[frame_names[idx]], reshape_size=(width, height))
                                     area_to_check = per_obj_input_mask_n[0][prompt_label]
 
                                     for key in selections:
@@ -801,13 +1342,107 @@ def sasvi_inference(
                                 break_endless_loop = False 
                                 idx += 1
                                 continue
-                            print("Adding new labels for frame "  + frame_names[idx] + " = Label " + str(prompt_label_list))
-                            break
+                            class_change_trigger = True
+                            reprompt_executed = True
+                            reprompt_reason = "class-change"
+                            video_summary["class_change_reprompts"] += 1
+                            trigger_next_idx = idx
+                            print(
+                                f"[reprompt] video={video_name} frame={frame_names[idx]} idx={idx} "
+                                f"reason=class-change labels={prompt_label_list}"
+                            )
                         break_endless_loop = False
 
                 old_label = list(set(old_label) & set(current_label)) + prompt_label_list
-            idx += 1    
-    return [inference_rows[key] for key in sorted(inference_rows)]
+
+            if (
+                not class_change_trigger
+                and enable_disagreement_gate
+                and out_frame_idx > segment_start_idx
+                and disagreement_counter >= disagreement_bad_frames
+            ):
+                disagreement_trigger = True
+                reprompt_executed = True
+                reprompt_reason = "disagreement"
+                trigger_next_idx = idx
+                prompt_label_list = []
+                negative_duplicate_list = []
+                current_label = sorted(set(current_overseer_mask.keys()))
+                old_label = current_label.copy()
+                video_summary["disagreement_reprompts"] += 1
+                print(
+                    f"[reprompt] video={video_name} frame={frame_names[idx]} idx={idx} "
+                    f"reason=disagreement iou={disagreement_metrics['iou']:.4f} "
+                    f"counter={disagreement_counter}"
+                )
+
+            trace_row = {
+                **inference_rows[frame_names[out_frame_idx]],
+                "sam2_vs_overseer_iou": disagreement_metrics["iou"],
+                "sam2_vs_overseer_fg_iou": disagreement_metrics["foreground_iou"],
+                "sam2_vs_overseer_boundary_distance": boundary_distance,
+                "disagreement_bad_frame": bad_disagreement_frame,
+                "disagreement_counter": disagreement_counter,
+                "class_change_trigger": class_change_trigger,
+                "disagreement_trigger": disagreement_trigger,
+                "reprompt_executed": reprompt_executed,
+                "reprompt_reason": reprompt_reason,
+                **gt_metrics,
+            }
+            trace_rows.append(trace_row)
+            print(
+                f"[trace] video={video_name} frame={frame_names[out_frame_idx]} idx={out_frame_idx} "
+                f"segment={segment_id} iou={disagreement_metrics['iou']:.4f} "
+                f"fg_iou={disagreement_metrics['foreground_iou']:.4f} "
+                f"boundary={'n/a' if boundary_distance is None or not np.isfinite(boundary_distance) else f'{boundary_distance:.4f}'} "
+                f"class_change={class_change_trigger} disagreement={disagreement_trigger} "
+                f"bad={bad_disagreement_frame} counter={disagreement_counter} "
+                f"reprompt={reprompt_executed} reason={reprompt_reason or 'none'}"
+            )
+
+            if (
+                disagreement_visual_dir is not None
+                and disagreement_visual_count < max_disagreement_visuals
+                and (bad_disagreement_frame or reprompt_executed)
+            ):
+                visual_path = os.path.join(
+                    disagreement_visual_dir,
+                    f"{frame_names[out_frame_idx]}_segment{segment_id}_disagreement.png",
+                )
+                save_disagreement_visual(
+                    path=visual_path,
+                    frame_path=frame_path_by_name[frame_names[out_frame_idx]],
+                    sam_foreground=disagreement_metrics["sam_foreground"],
+                    overseer_foreground=disagreement_metrics["overseer_foreground"],
+                )
+                disagreement_visual_count += 1
+
+            if reprompt_executed:
+                break
+            idx += 1
+        if trigger_next_idx is None:
+            if idx >= len(frame_names) - 1:
+                idx = len(frame_names)
+            else:
+                idx += 1
+        else:
+            idx = trigger_next_idx
+    if temp_subset_root is not None:
+        try:
+            for frame_info in frame_infos:
+                os.unlink(os.path.join(predictor_video_dir, os.path.basename(frame_info["path"])))
+            os.rmdir(predictor_video_dir)
+            os.rmdir(temp_subset_root)
+        except OSError:
+            pass
+    if per_frame_ious:
+        video_summary["mean_iou"] = float(np.mean(per_frame_ious))
+        video_summary["min_iou"] = float(np.min(per_frame_ious))
+    if gt_macro_ious:
+        video_summary["gt_macro_iou_mean"] = float(np.mean(gt_macro_ious))
+        video_summary["gt_macro_dice_mean"] = float(np.mean(gt_macro_dices))
+        video_summary["gt_pixel_accuracy_mean"] = float(np.mean(gt_pixel_accuracies))
+    return trace_rows, video_summary
 
 
 def main():
@@ -869,6 +1504,32 @@ def main():
         help="directory to save the output masks (as PNG files)",
     )
     parser.add_argument(
+        "--video_name",
+        type=str,
+        help="optional single video/clip folder name to run, e.g. video01_00080",
+    )
+    parser.add_argument(
+        "--video_names",
+        type=str,
+        nargs="+",
+        help="optional list of video/clip folder names to run, e.g. video01_00080 video01_00160",
+    )
+    parser.add_argument(
+        "--frame_name",
+        type=str,
+        help="optional single frame stem to run, e.g. frame_80_endo or 0080",
+    )
+    parser.add_argument(
+        "--start_frame",
+        type=int,
+        help="optional first frame index to process",
+    )
+    parser.add_argument(
+        "--end_frame",
+        type=int,
+        help="optional last frame index to process",
+    )
+    parser.add_argument(
         "--score_thresh",
         type=float,
         default=0.0,
@@ -900,7 +1561,59 @@ def main():
         type=str,
         help="optional directory for confidence maps and inference metadata exported for analysis.",
     )
+    parser.add_argument(
+        "--gt_root_dir",
+        type=str,
+        help="optional root directory for ground-truth masks. If omitted, GT masks are searched next to the input frames.",
+    )
+    parser.add_argument(
+        "--enable_disagreement_gate",
+        action="store_true",
+        help="enable disagreement-gated corrective re-prompting.",
+    )
+    parser.add_argument(
+        "--disagreement_iou_threshold",
+        type=float,
+        default=0.5,
+        help="trigger a bad disagreement frame when SAM2 vs Overseer IoU falls below this value.",
+    )
+    parser.add_argument(
+        "--disagreement_bad_frames",
+        type=int,
+        default=2,
+        help="minimum consecutive bad disagreement frames before corrective re-prompting.",
+    )
+    parser.add_argument(
+        "--enable_boundary_distance_gate",
+        action="store_true",
+        help="also allow disagreement triggering using foreground boundary distance.",
+    )
+    parser.add_argument(
+        "--boundary_distance_threshold",
+        type=float,
+        default=20.0,
+        help="boundary-distance trigger threshold in pixels when boundary gating is enabled.",
+    )
+    parser.add_argument(
+        "--save_disagreement_visuals",
+        action="store_true",
+        help="save lightweight disagreement overlay images for bad/triggered frames.",
+    )
+    parser.add_argument(
+        "--max_disagreement_visuals",
+        type=int,
+        default=10,
+        help="maximum number of disagreement debug visuals to save per video.",
+    )
     args = parser.parse_args()
+    if args.frame_name is not None and (args.start_frame is not None or args.end_frame is not None):
+        raise ValueError("--frame_name cannot be combined with --start_frame/--end_frame")
+    if args.disagreement_bad_frames < 1:
+        raise ValueError("--disagreement_bad_frames must be >= 1")
+    if args.video_name is not None and args.video_names is not None:
+        raise ValueError("Use either --video_name or --video_names, not both")
+    if str(args.device).lower().startswith("cpu"):
+        configure_cpu_runtime()
 
     # if we use per-object PNG files, they could possibly overlap in inputs and outputs
     hydra_overrides_extra = [
@@ -913,12 +1626,26 @@ def main():
         apply_postprocessing=args.apply_postprocessing,
         hydra_overrides_extra=hydra_overrides_extra,
     )
-    video_names = [
-        p
-        for p in os.listdir(args.base_video_dir)
-        if os.path.isdir(os.path.join(args.base_video_dir, p))
-    ]
-    video_names = sorted(video_names)
+    video_entries = discover_video_dirs(args.base_video_dir)
+    if not video_entries:
+        raise RuntimeError(f"No video folders with frames found under {args.base_video_dir}")
+
+    requested_video_names = None
+    if args.video_name is not None:
+        requested_video_names = {args.video_name}
+    elif args.video_names is not None:
+        requested_video_names = set(args.video_names)
+
+    if requested_video_names is not None:
+        video_entries = [entry for entry in video_entries if entry[0] in requested_video_names]
+        if not video_entries:
+            raise RuntimeError(f"Requested video(s) not found under {args.base_video_dir}: {sorted(requested_video_names)}")
+        found_names = {name for name, _ in video_entries}
+        missing_names = sorted(requested_video_names - found_names)
+        if missing_names:
+            raise RuntimeError(f"Requested video(s) not found under {args.base_video_dir}: {missing_names}")
+
+    video_names = [name for name, _ in video_entries]
 
     # adding this filter based on the dataset type
     if args.dataset_type == "CADIS":
@@ -926,7 +1653,6 @@ def main():
         num_classes = 18
         ignore_indices = [255]
         shift_by_1 = True
-        palette = get_cadis_colormap()
         maskrcnn_hidden_ft = 32
         maskrcnn_backbone = 'ResNet18'
         
@@ -935,7 +1661,6 @@ def main():
         num_classes = 13
         ignore_indices = [0] if args.overseer_type == "Mask2Former" else []
         shift_by_1 = False
-        palette = get_cholecseg8k_colormap()
         maskrcnn_hidden_ft = 64
         maskrcnn_backbone = 'ResNet50'
 
@@ -944,12 +1669,14 @@ def main():
         num_classes = 14
         ignore_indices = [0] if args.overseer_type == "DETR" or args.overseer_type == "Mask2Former" else []
         shift_by_1 = False
-        palette = get_cataract1k_colormap()
         maskrcnn_hidden_ft = 32
         maskrcnn_backbone = 'ResNet18'
 
     else:        
         raise NotImplementedError
+
+    palette = get_primary_visual_palette(num_classes)
+    gt_dataset_config = get_dataset_config(args.dataset_type)
 
     if args.overseer_type == "MaskRCNN":
         maskrcnn_model = get_model_instance_segmentation(
@@ -1013,14 +1740,19 @@ def main():
     print(f"running SASVI prediction on {len(video_names)} videos:\n{video_names}")
     start_time = time.time()
     inference_rows = []
+    video_summaries = []
     
-    for n_video, video_name in enumerate(video_names):
+    for n_video, (video_name, video_dir) in enumerate(video_entries):
         print(f"\n{n_video + 1}/{len(video_names)} - running on {video_name}")
-        inference_rows.extend(sasvi_inference(
+        video_rows, video_summary = sasvi_inference(
             predictor=predictor,
             base_video_dir=args.base_video_dir,
             output_mask_dir=args.output_mask_dir,
             video_name=video_name,
+            video_dir=video_dir,
+            start_frame=args.start_frame,
+            end_frame=args.end_frame,
+            frame_name=args.frame_name,
 
             overseer_type=args.overseer_type,
             overseer_mask_dir=args.overseer_mask_dir,
@@ -1032,15 +1764,50 @@ def main():
             shift_by_1=shift_by_1,
             palette=palette,
             dataset_type=args.dataset_type,
+            gt_dataset_config=gt_dataset_config,
+            gt_root_dir=args.gt_root_dir,
             
             score_thresh=args.score_thresh,
             save_binary_mask=args.save_binary_mask,
             analysis_output_dir=args.analysis_output_dir,
-        ))
+            enable_disagreement_gate=args.enable_disagreement_gate,
+            disagreement_iou_threshold=args.disagreement_iou_threshold,
+            disagreement_bad_frames=args.disagreement_bad_frames,
+            enable_boundary_distance_gate=args.enable_boundary_distance_gate,
+            boundary_distance_threshold=args.boundary_distance_threshold,
+            save_disagreement_visuals=args.save_disagreement_visuals,
+            max_disagreement_visuals=args.max_disagreement_visuals,
+        )
+        inference_rows.extend(video_rows)
+        video_summaries.append(video_summary)
 
     if args.analysis_output_dir is not None and len(inference_rows) > 0:
         metadata_path = os.path.join(args.analysis_output_dir, "inference", "inference_metadata.csv")
         write_rows_to_csv(metadata_path, inference_rows, INFERENCE_METADATA_COLUMNS)
+        report_path = os.path.join(args.analysis_output_dir, "inference", "disagreement_gate_report.md")
+        write_markdown_report(
+            report_path,
+            config={
+                "device": args.device,
+                "dataset_type": args.dataset_type,
+                "base_video_dir": args.base_video_dir,
+                "gt_root_dir": args.gt_root_dir,
+                "video_name": args.video_name,
+                "video_names": args.video_names,
+                "frame_name": args.frame_name,
+                "start_frame": args.start_frame,
+                "end_frame": args.end_frame,
+                "enable_disagreement_gate": args.enable_disagreement_gate,
+                "disagreement_iou_threshold": args.disagreement_iou_threshold,
+                "disagreement_bad_frames": args.disagreement_bad_frames,
+                "enable_boundary_distance_gate": args.enable_boundary_distance_gate,
+                "boundary_distance_threshold": args.boundary_distance_threshold,
+                "save_disagreement_visuals": args.save_disagreement_visuals,
+                "max_disagreement_visuals": args.max_disagreement_visuals,
+            },
+            video_summaries=video_summaries,
+            trace_rows=inference_rows,
+        )
 
     elapsed_time = time.time() - start_time
     print(f"Time taken: {elapsed_time:.6f} seconds")

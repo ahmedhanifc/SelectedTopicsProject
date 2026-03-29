@@ -13,12 +13,27 @@ INFERENCE_METADATA_COLUMNS = [
     "video_name",
     "frame_name",
     "frame_idx",
+    "segment_id",
     "num_objects",
     "confidence_path",
     "confidence_mean",
     "confidence_std",
     "confidence_min",
     "confidence_max",
+    "sam2_vs_overseer_iou",
+    "sam2_vs_overseer_fg_iou",
+    "sam2_vs_overseer_boundary_distance",
+    "disagreement_bad_frame",
+    "disagreement_counter",
+    "class_change_trigger",
+    "disagreement_trigger",
+    "reprompt_executed",
+    "reprompt_reason",
+    "gt_mask_path",
+    "gt_pixel_accuracy",
+    "gt_macro_iou",
+    "gt_macro_dice",
+    "gt_error_rate",
 ]
 
 
@@ -81,3 +96,102 @@ def write_rows_to_csv(path: str | Path, rows: list[dict], fieldnames: list[str])
         writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key) for key in fieldnames})
+
+
+def write_markdown_report(
+    path: str | Path,
+    *,
+    config: dict,
+    video_summaries: list[dict],
+    trace_rows: list[dict],
+) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "# Disagreement-Gated Re-prompting Report",
+        "",
+        "## Configuration",
+        "",
+    ]
+    for key, value in config.items():
+        lines.append(f"- `{key}`: `{value}`")
+
+    lines.extend([
+        "",
+        "## Video Summary",
+        "",
+        "| Video | Frames | Segments | Class-change re-prompts | Disagreement re-prompts | Mean IoU | Min IoU | GT Macro IoU | GT Macro Dice | GT Pixel Acc |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    for summary in video_summaries:
+        gt_macro_iou = summary.get("gt_macro_iou_mean")
+        gt_macro_dice = summary.get("gt_macro_dice_mean")
+        gt_pixel_accuracy = summary.get("gt_pixel_accuracy_mean")
+        lines.append(
+            f"| {summary['video_name']} | {summary['frames_processed']} | {summary['segments_started']} | "
+            f"{summary['class_change_reprompts']} | {summary['disagreement_reprompts']} | "
+            f"{summary['mean_iou']:.4f} | {summary['min_iou']:.4f} | "
+            f"{'n/a' if gt_macro_iou is None else f'{gt_macro_iou:.4f}'} | "
+            f"{'n/a' if gt_macro_dice is None else f'{gt_macro_dice:.4f}'} | "
+            f"{'n/a' if gt_pixel_accuracy is None else f'{gt_pixel_accuracy:.4f}'} |"
+        )
+
+    lines.extend([
+        "",
+        "## Interpretation",
+        "",
+    ])
+    total_class_change = sum(item["class_change_reprompts"] for item in video_summaries)
+    total_disagreement = sum(item["disagreement_reprompts"] for item in video_summaries)
+    if total_disagreement > 0:
+        lines.append(
+            f"Disagreement gating triggered `{total_disagreement}` corrective re-prompt(s), "
+            f"in addition to `{total_class_change}` class-change re-prompt(s)."
+        )
+    else:
+        lines.append(
+            f"No disagreement-based re-prompts fired. Class-change re-prompts fired `{total_class_change}` time(s)."
+        )
+
+    gt_rows = [row for row in trace_rows if row.get("gt_macro_iou") is not None]
+    if gt_rows:
+        lines.append(
+            f" Ground-truth comparison was available for `{len(gt_rows)}` frame(s): "
+            f"mean GT macro IoU `{np.mean([row['gt_macro_iou'] for row in gt_rows]):.4f}`, "
+            f"mean GT macro Dice `{np.mean([row['gt_macro_dice'] for row in gt_rows]):.4f}`, "
+            f"mean GT pixel accuracy `{np.mean([row['gt_pixel_accuracy'] for row in gt_rows]):.4f}`."
+        )
+
+    sampled_rows = trace_rows[: min(len(trace_rows), 60)]
+    lines.extend([
+        "",
+        "## Sampled IoU Trace",
+        "",
+        "| Video | Frame | Idx | Segment | IoU | FG IoU | GT IoU | GT Dice | GT Acc | Boundary Dist | Bad | Counter | Class-change | Disagreement | Re-prompt | Reason |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- | --- | --- | --- |",
+    ])
+    for row in sampled_rows:
+        boundary_distance = row.get("sam2_vs_overseer_boundary_distance")
+        if boundary_distance is None or not np.isfinite(boundary_distance):
+            boundary_value = "n/a"
+        else:
+            boundary_value = f"{boundary_distance:.4f}"
+        gt_iou = row.get("gt_macro_iou")
+        gt_dice = row.get("gt_macro_dice")
+        gt_acc = row.get("gt_pixel_accuracy")
+        lines.append(
+            f"| {row.get('video_name', '')} | {row.get('frame_name', '')} | {row.get('frame_idx', '')} | "
+            f"{row.get('segment_id', '')} | {row.get('sam2_vs_overseer_iou', float('nan')):.4f} | "
+            f"{row.get('sam2_vs_overseer_fg_iou', float('nan')):.4f} | "
+            f"{'n/a' if gt_iou is None else f'{gt_iou:.4f}'} | "
+            f"{'n/a' if gt_dice is None else f'{gt_dice:.4f}'} | "
+            f"{'n/a' if gt_acc is None else f'{gt_acc:.4f}'} | "
+            f"{boundary_value} | "
+            f"{row.get('disagreement_bad_frame', False)} | {row.get('disagreement_counter', 0)} | "
+            f"{row.get('class_change_trigger', False)} | {row.get('disagreement_trigger', False)} | "
+            f"{row.get('reprompt_executed', False)} | {row.get('reprompt_reason', '')} |"
+        )
+
+    with output_path.open("w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
