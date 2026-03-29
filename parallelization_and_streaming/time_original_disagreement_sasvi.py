@@ -16,9 +16,10 @@ SAM2_ROOT = REPO_ROOT / "src" / "sam2"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SAM2_ROOT))
 
+from analysis_tools.config import get_dataset_config
 from analysis_tools.inference_export import INFERENCE_METADATA_COLUMNS, write_markdown_report, write_rows_to_csv
 from sam2.build_sam import build_sam2_video_predictor
-from src.sam2.eval_sasvi import sasvi_inference, discover_video_dirs
+from src.sam2.eval_sasvi import discover_video_dirs, get_primary_visual_palette, sasvi_inference
 
 from parallelization_and_streaming.parallel_disagreement_sasvi import (
     build_dataset_config,
@@ -51,6 +52,12 @@ def parse_args() -> argparse.Namespace:
         help="Dataset type.",
     )
     parser.add_argument("--base_video_dir", type=str, required=True, help="Directory containing video frame folders.")
+    parser.add_argument(
+        "--gt_root_dir",
+        type=str,
+        default=None,
+        help="Optional root directory for ground-truth masks. If omitted, GT masks are searched next to the input frames.",
+    )
     parser.add_argument(
         "--output_root",
         type=Path,
@@ -134,6 +141,7 @@ def main() -> None:
         raise RuntimeError("No videos left to process after filtering.")
 
     cfg = build_dataset_config(args.dataset_type, args.overseer_type)
+    gt_dataset_config = get_dataset_config(args.dataset_type)
     overseer_model = build_overseer_model(args, cfg)
 
     hydra_overrides_extra = ["++model.non_overlap_masks=true"]
@@ -160,6 +168,7 @@ def main() -> None:
         [
             ("run_name", run_timestamp),
             ("base_video_dir", args.base_video_dir),
+            ("gt_root_dir", args.gt_root_dir),
             ("output_root", str(run_output_dir)),
             ("analysis_output_dir", str(run_analysis_dir)),
             ("sam2_cfg", args.sam2_cfg),
@@ -211,8 +220,10 @@ def main() -> None:
             num_classes=int(cfg["num_classes"]),
             ignore_indices=list(cfg["ignore_indices"]),
             shift_by_1=bool(cfg["shift_by_1"]),
-            palette=list(cfg["palette"]),
+            palette=list(get_primary_visual_palette(int(cfg["num_classes"]))),
             dataset_type=args.dataset_type,
+            gt_dataset_config=gt_dataset_config,
+            gt_root_dir=args.gt_root_dir,
             score_thresh=args.score_thresh,
             save_binary_mask=args.save_binary_mask,
             analysis_output_dir=str(run_analysis_dir),
@@ -283,6 +294,7 @@ def main() -> None:
                 "device": args.device,
                 "dataset_type": args.dataset_type,
                 "base_video_dir": args.base_video_dir,
+                "gt_root_dir": args.gt_root_dir,
                 "video_name": args.video_name,
                 "video_names": args.video_names,
                 "frame_name": args.frame_name,

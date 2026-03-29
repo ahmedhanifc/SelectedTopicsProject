@@ -35,6 +35,8 @@ from analysis_tools.inference_export import (
     write_markdown_report,
     write_rows_to_csv,
 )
+from analysis_tools.config import get_dataset_config
+from analysis_tools.error_analysis import compute_frame_metrics, load_dataset_mask
 from sam2.build_sam import build_sam2_video_predictor
 from src.data import insert_component_masks, remap_labels
 from src.model import get_model_instance_segmentation
@@ -47,11 +49,14 @@ from src.sam2.eval_sasvi import (
     compute_disagreement_metrics,
     discover_video_dirs,
     get_per_obj_mask,
+    get_primary_visual_palette,
     get_points_from_mask,
     get_unique_label,
     infer_frame_sort_key,
     list_video_frames,
     put_per_obj_mask,
+    per_obj_mask_to_label_map,
+    resolve_gt_mask_path,
     save_disagreement_visual,
     save_masks_to_dir,
 )
@@ -192,7 +197,7 @@ def build_dataset_config(dataset_type: str, overseer_type: str) -> dict[str, obj
             "num_classes": 18,
             "ignore_indices": [255],
             "shift_by_1": True,
-            "palette": flatten_palette(get_cadis_colormap()),
+            "palette": flatten_palette(get_primary_visual_palette(18)),
             "maskrcnn_hidden_ft": 32,
             "maskrcnn_backbone": "ResNet18",
         }
@@ -201,7 +206,7 @@ def build_dataset_config(dataset_type: str, overseer_type: str) -> dict[str, obj
             "num_classes": 13,
             "ignore_indices": [0] if overseer_type == "Mask2Former" else [],
             "shift_by_1": False,
-            "palette": flatten_palette(get_cholecseg8k_colormap()),
+            "palette": flatten_palette(get_primary_visual_palette(13)),
             "maskrcnn_hidden_ft": 64,
             "maskrcnn_backbone": "ResNet50",
         }
@@ -210,7 +215,7 @@ def build_dataset_config(dataset_type: str, overseer_type: str) -> dict[str, obj
             "num_classes": 14,
             "ignore_indices": [0] if overseer_type in {"DETR", "Mask2Former"} else [],
             "shift_by_1": False,
-            "palette": flatten_palette(get_cataract1k_colormap()),
+            "palette": flatten_palette(get_primary_visual_palette(14)),
             "maskrcnn_hidden_ft": 32,
             "maskrcnn_backbone": "ResNet18",
         }
@@ -535,6 +540,7 @@ def parallel_disagreement_inference(
     shift_by_1: bool,
     palette: list[int],
     dataset_type: str,
+    gt_dataset_config,
     analysis_output_dir: str,
     save_queue: queue.Queue,
     save_stop_event: threading.Event,
@@ -542,6 +548,7 @@ def parallel_disagreement_inference(
     end_frame: int | None = None,
     frame_name: str | None = None,
     video_dir: str | None = None,
+    gt_root_dir: str | None = None,
     score_thresh: float = 0.0,
     save_binary_mask: bool = False,
     enable_disagreement_gate: bool = False,
@@ -637,12 +644,19 @@ def parallel_disagreement_inference(
         "disagreement_reprompts": 0,
         "mean_iou": 1.0,
         "min_iou": 1.0,
+        "gt_frames_evaluated": 0,
+        "gt_macro_iou_mean": None,
+        "gt_macro_dice_mean": None,
+        "gt_pixel_accuracy_mean": None,
         "overseer_cache_seconds": overseer_cache_seconds,
         "sasvi_seconds": 0.0,
         "throughput_fps": 0.0,
     }
 
     per_frame_ious = []
+    gt_macro_ious = []
+    gt_macro_dices = []
+    gt_pixel_accuracies = []
     prompt_label_list = []
     negative_duplicate_list = []
     old_label = []
@@ -786,6 +800,46 @@ def parallel_disagreement_inference(
                     "num_objects": len(out_obj_ids),
                     **confidence_stats,
                 }
+
+                gt_mask_path = resolve_gt_mask_path(
+                    frame_name=frame_names[out_frame_idx],
+                    video_dir=video_dir,
+                    video_name=video_name,
+                    base_video_dir=base_video_dir,
+                    gt_root_dir=gt_root_dir,
+                )
+                gt_metrics = {
+                    "gt_mask_path": gt_mask_path,
+                    "gt_pixel_accuracy": None,
+                    "gt_macro_iou": None,
+                    "gt_macro_dice": None,
+                    "gt_error_rate": None,
+                }
+                if gt_mask_path is not None:
+                    pred_label_map = per_obj_mask_to_label_map(
+                        per_obj_mask=per_obj_output_mask,
+                        height=height,
+                        width=width,
+                        shift_by_1=shift_by_1,
+                    )
+                    gt_label_map = load_dataset_mask(gt_mask_path, gt_dataset_config)
+                    gt_frame_metrics = compute_frame_metrics(
+                        pred_mask=pred_label_map,
+                        gt_mask=gt_label_map,
+                        dataset_config=gt_dataset_config,
+                    )
+                    if gt_frame_metrics["macro_iou"] is not None:
+                        gt_metrics = {
+                            "gt_mask_path": gt_mask_path,
+                            "gt_pixel_accuracy": gt_frame_metrics["pixel_accuracy"],
+                            "gt_macro_iou": gt_frame_metrics["macro_iou"],
+                            "gt_macro_dice": gt_frame_metrics["macro_dice"],
+                            "gt_error_rate": gt_frame_metrics["error_rate"],
+                        }
+                        gt_macro_ious.append(gt_frame_metrics["macro_iou"])
+                        gt_macro_dices.append(gt_frame_metrics["macro_dice"])
+                        gt_pixel_accuracies.append(gt_frame_metrics["pixel_accuracy"])
+                        video_summary["gt_frames_evaluated"] += 1
 
                 bad_disagreement_frame = False
                 if enable_disagreement_gate and out_frame_idx > segment_start_idx:
@@ -944,6 +998,7 @@ def parallel_disagreement_inference(
                     "disagreement_trigger": disagreement_trigger,
                     "reprompt_executed": reprompt_executed,
                     "reprompt_reason": reprompt_reason,
+                    **gt_metrics,
                 }
                 trace_rows.append(trace_row)
                 print(
@@ -1019,6 +1074,10 @@ def parallel_disagreement_inference(
     if per_frame_ious:
         video_summary["mean_iou"] = float(np.mean(per_frame_ious))
         video_summary["min_iou"] = float(np.min(per_frame_ious))
+    if gt_macro_ious:
+        video_summary["gt_macro_iou_mean"] = float(np.mean(gt_macro_ious))
+        video_summary["gt_macro_dice_mean"] = float(np.mean(gt_macro_dices))
+        video_summary["gt_pixel_accuracy_mean"] = float(np.mean(gt_pixel_accuracies))
 
     total_elapsed = overseer_cache_seconds + sasvi_seconds
     video_summary["throughput_fps"] = (
@@ -1050,6 +1109,12 @@ def parse_args() -> argparse.Namespace:
         help="Dataset type.",
     )
     parser.add_argument("--base_video_dir", type=str, required=True, help="Directory containing video frame folders.")
+    parser.add_argument(
+        "--gt_root_dir",
+        type=str,
+        default=None,
+        help="Optional root directory for ground-truth masks. If omitted, GT masks are searched next to the input frames.",
+    )
     parser.add_argument(
         "--output_root",
         type=Path,
@@ -1159,6 +1224,7 @@ def main() -> None:
         raise RuntimeError("No videos left to process after filtering.")
 
     cfg = build_dataset_config(args.dataset_type, args.overseer_type)
+    gt_dataset_config = get_dataset_config(args.dataset_type)
     predictor = build_predictor(args)
     overseer_model = build_overseer_model(args, cfg)
     nnunet_model = None
@@ -1180,6 +1246,7 @@ def main() -> None:
         [
             ("run_name", run_timestamp),
             ("base_video_dir", args.base_video_dir),
+            ("gt_root_dir", args.gt_root_dir),
             ("output_root", str(run_output_dir)),
             ("analysis_output_dir", str(run_analysis_dir)),
             ("sam2_cfg", args.sam2_cfg),
@@ -1243,12 +1310,14 @@ def main() -> None:
                 shift_by_1=bool(cfg["shift_by_1"]),
                 palette=list(cfg["palette"]),
                 dataset_type=args.dataset_type,
+                gt_dataset_config=gt_dataset_config,
                 analysis_output_dir=str(run_analysis_dir),
                 save_queue=save_queue,
                 save_stop_event=save_stop_event,
                 start_frame=args.start_frame,
                 end_frame=args.end_frame,
                 frame_name=args.frame_name,
+                gt_root_dir=args.gt_root_dir,
                 score_thresh=args.score_thresh,
                 save_binary_mask=args.save_binary_mask,
                 enable_disagreement_gate=args.enable_disagreement_gate,
@@ -1326,6 +1395,7 @@ def main() -> None:
                 "device": args.device,
                 "dataset_type": args.dataset_type,
                 "base_video_dir": args.base_video_dir,
+                "gt_root_dir": args.gt_root_dir,
                 "video_name": args.video_name,
                 "video_names": args.video_names,
                 "frame_name": args.frame_name,
