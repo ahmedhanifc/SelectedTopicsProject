@@ -68,6 +68,8 @@ For each analyzed frame, the report saves:
 - `<frame>_image.png`
 - `<frame>_pred_rgb.png`
 - `<frame>_gt_rgb.png`
-- `<frame>_error_map.png`
+- `<frame>_error_map.png` for the image-backed error view
+- `<frame>_error_map_mask.png` for the RGB-mask-backed error view
 - `<frame>_confidence.png` if available
-- `<frame>_overlay.png`
+- `<frame>_overlay.png` for the image-backed composite
+- `<frame>_overlay_mask.png` for the image-backed composite with only the error panel using the RGB mask backdrop

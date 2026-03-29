@@ -266,20 +266,20 @@ def _confidence_band_masks(confidence_map: np.ndarray,
     return low_confidence_mask, medium_confidence_mask, high_confidence_mask
 
 
-def _annotate_error_map(image: np.ndarray,
+def _annotate_error_map(base_canvas: np.ndarray,
+                        soften_base_canvas: bool,
                         error_map: np.ndarray,
                         confidence_map: np.ndarray | None,
                         valid_mask: np.ndarray,
-                        background_index: int | None,
-                        pred_mask: np.ndarray,
                         has_confidence: bool,
                         low_threshold: float,
                         medium_threshold: float) -> np.ndarray:
-    softened_image = _soften_image(image[:, :, :3].astype(np.uint8))
-    annotated_map = softened_image.copy()
+    base_canvas = base_canvas[:, :, :3].astype(np.uint8)
+    background = _soften_image(base_canvas) if soften_base_canvas else base_canvas.copy()
+    annotated_map = background.copy()
     error_pixels = error_map.any(axis=2)
     if error_pixels.any():
-        annotated_map[error_pixels] = _blend(softened_image[error_pixels], error_map[error_pixels], alpha=ERROR_OVERLAY_ALPHA)
+        annotated_map[error_pixels] = _blend(background[error_pixels], error_map[error_pixels], alpha=ERROR_OVERLAY_ALPHA)
     if confidence_map is not None:
         correct_region_mask = np.logical_and(valid_mask, ~error_map.any(axis=2))
         low_confidence_mask, medium_confidence_mask, high_confidence_mask = _confidence_band_masks(
@@ -316,23 +316,25 @@ def _annotate_error_map(image: np.ndarray,
 
 
 def _make_overlay(image: np.ndarray,
+                  error_canvas: np.ndarray,
+                  base_label: str,
+                  soften_error_canvas: bool,
                   pred_rgb: np.ndarray,
                   gt_rgb: np.ndarray,
                   error_map: np.ndarray,
                   confidence_map: np.ndarray | None,
                   valid_mask: np.ndarray,
                   low_confidence_threshold: float,
-                  medium_confidence_threshold: float,
-                  background_index: int | None,
-                  pred_mask: np.ndarray) -> np.ndarray:
+                  medium_confidence_threshold: float) -> np.ndarray:
     image = image[:, :, :3].astype(np.uint8)
+    error_canvas = error_canvas[:, :, :3].astype(np.uint8)
     pred_overlay = _blend(image, pred_rgb, alpha=PREDICTION_OVERLAY_ALPHA)
     gt_overlay = _blend(image, gt_rgb, alpha=GROUND_TRUTH_OVERLAY_ALPHA)
-    softened_image = _soften_image(image)
-    error_overlay = softened_image.copy()
+    error_background = _soften_image(error_canvas) if soften_error_canvas else error_canvas.copy()
+    error_overlay = error_background.copy()
     error_pixels = error_map.any(axis=2)
     if error_pixels.any():
-        error_overlay[error_pixels] = _blend(softened_image[error_pixels], error_map[error_pixels], alpha=ERROR_OVERLAY_ALPHA)
+        error_overlay[error_pixels] = _blend(error_background[error_pixels], error_map[error_pixels], alpha=ERROR_OVERLAY_ALPHA)
 
     confidence_rgb = _stack_confidence_rgb(confidence_map, image.shape)
 
@@ -398,7 +400,7 @@ def _make_overlay(image: np.ndarray,
     overlay = _add_panel_titles(
         overlay,
         labels=[
-            ("Input image", (10, 8)),
+            (base_label, (10, 8)),
             ("Prediction overlay", (image.shape[1] + 10, 8)),
             ("Ground truth overlay", (10, image.shape[0] + 8)),
             ("Error overlay", (image.shape[1] + 10, image.shape[0] + 8)),
@@ -510,9 +512,13 @@ def analyze_predictions(frame_root: Path,
             gt_classes = sorted(np.unique(gt_mask[valid_mask]).tolist())
             pred_rgb = _colorize_mask(pred_mask, dataset_config.palette, dataset_config.ignore_index)
             gt_rgb = _colorize_mask(gt_mask, dataset_config.palette, dataset_config.ignore_index)
+            mask_backdrop = gt_rgb.copy()
             error_map = _build_error_map(pred_mask, gt_mask, valid_mask, dataset_config.background_index)
             overlay = _make_overlay(
                 image=image,
+                error_canvas=image,
+                base_label="Input image",
+                soften_error_canvas=True,
                 pred_rgb=pred_rgb,
                 gt_rgb=gt_rgb,
                 error_map=error_map,
@@ -520,16 +526,36 @@ def analyze_predictions(frame_root: Path,
                 valid_mask=valid_mask,
                 low_confidence_threshold=low_confidence_threshold,
                 medium_confidence_threshold=medium_confidence_threshold,
-                background_index=dataset_config.background_index,
-                pred_mask=pred_mask,
             )
-            error_map_annotated = _annotate_error_map(
+            overlay_mask = _make_overlay(
                 image=image,
+                error_canvas=mask_backdrop,
+                base_label="Input image",
+                soften_error_canvas=False,
+                pred_rgb=pred_rgb,
+                gt_rgb=gt_rgb,
                 error_map=error_map,
                 confidence_map=confidence_map,
                 valid_mask=valid_mask,
-                background_index=dataset_config.background_index,
-                pred_mask=pred_mask,
+                low_confidence_threshold=low_confidence_threshold,
+                medium_confidence_threshold=medium_confidence_threshold,
+            )
+            error_map_annotated = _annotate_error_map(
+                base_canvas=image,
+                soften_base_canvas=True,
+                error_map=error_map,
+                confidence_map=confidence_map,
+                valid_mask=valid_mask,
+                has_confidence=confidence_map is not None,
+                low_threshold=low_confidence_threshold,
+                medium_threshold=medium_confidence_threshold,
+            )
+            error_map_mask_annotated = _annotate_error_map(
+                base_canvas=mask_backdrop,
+                soften_base_canvas=False,
+                error_map=error_map,
+                confidence_map=confidence_map,
+                valid_mask=valid_mask,
                 has_confidence=confidence_map is not None,
                 low_threshold=low_confidence_threshold,
                 medium_threshold=medium_confidence_threshold,
@@ -540,14 +566,18 @@ def analyze_predictions(frame_root: Path,
             pred_artifact_path = artifact_dir / f"{frame_name}_pred_rgb.png"
             gt_artifact_path = artifact_dir / f"{frame_name}_gt_rgb.png"
             error_artifact_path = artifact_dir / f"{frame_name}_error_map.png"
+            error_mask_artifact_path = artifact_dir / f"{frame_name}_error_map_mask.png"
             overlay_artifact_path = artifact_dir / f"{frame_name}_overlay.png"
+            overlay_mask_artifact_path = artifact_dir / f"{frame_name}_overlay_mask.png"
             image_artifact_path = artifact_dir / f"{frame_name}_image.png"
 
             Image.fromarray(image).save(image_artifact_path)
             Image.fromarray(pred_rgb).save(pred_artifact_path)
             Image.fromarray(gt_rgb).save(gt_artifact_path)
             Image.fromarray(error_map_annotated).save(error_artifact_path)
+            Image.fromarray(error_map_mask_annotated).save(error_mask_artifact_path)
             Image.fromarray(overlay).save(overlay_artifact_path)
+            Image.fromarray(overlay_mask).save(overlay_mask_artifact_path)
 
             confidence_stats = {
                 "confidence_mean": "",
