@@ -1,6 +1,7 @@
 data/
 dataset/
 frame_root/
+gt_root/
 output_masks/
 output_masks_*/
 analysis_output/
@@ -190,8 +191,6 @@ tmp/
 
 # output folders
 stream_outputs/
-old_tests/
-
 disagreement_frame_outputs/
 parallel_disagreement_frame_outputs/
 
@@ -199,12 +198,6 @@ running_commands.txt
 PARALLEL_SASVI_FRAMES_REPORT.md
 JIJI_README.md
 
-analysis_output/**
-analysis_output_disagreement/**
-analysis_output_disagreement_parallel/**
-**/confidence_maps/
-*.png
-gt_root/
-
 archive/
-analysis_output*/
+old_tests/
+normalize_cholecseg8k_prediction_masks.py
