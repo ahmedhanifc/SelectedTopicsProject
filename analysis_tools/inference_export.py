@@ -37,7 +37,9 @@ INFERENCE_METADATA_COLUMNS = [
 ]
 
 
-def compute_confidence_map(mask_logits: torch.Tensor) -> np.ndarray:
+def compute_confidence_map(mask_logits: torch.Tensor,
+                           object_ids: list[int] | torch.Tensor,
+                           score_thresh: float) -> np.ndarray:
     logits = mask_logits.detach().float().cpu()
     if logits.ndim == 4 and logits.shape[1] == 1:
         logits = logits.squeeze(1)
@@ -47,8 +49,27 @@ def compute_confidence_map(mask_logits: torch.Tensor) -> np.ndarray:
         raise ValueError(f"Expected mask logits in [N,H,W] or [H,W] format, got {tuple(logits.shape)}")
 
     probs = torch.sigmoid(logits)
-    confidence = probs.max(dim=0).values
-    return confidence.numpy().astype(np.float32)
+    if isinstance(object_ids, torch.Tensor):
+        object_ids = object_ids.detach().cpu().tolist()
+    object_ids = [int(object_id) for object_id in object_ids]
+
+    if probs.shape[0] != len(object_ids):
+        raise ValueError(
+            "Number of logits channels must match number of object ids, "
+            f"got {probs.shape[0]} channels and {len(object_ids)} ids"
+        )
+
+    probs_np = probs.numpy().astype(np.float32)
+    confidence = 1.0 - probs_np.max(axis=0)
+    thresholded_masks = probs_np > float(score_thresh)
+    object_index = {object_id: index for index, object_id in enumerate(object_ids)}
+
+    # Mirror put_per_obj_mask(): higher label ids overwrite lower ones on overlap.
+    for object_id in sorted(object_ids, reverse=True):
+        mask = thresholded_masks[object_index[object_id]]
+        confidence[mask] = probs_np[object_index[object_id]][mask]
+
+    return np.clip(confidence, 0.0, 1.0).astype(np.float32)
 
 
 def summarise_confidence_map(confidence_map: np.ndarray) -> dict[str, float]:

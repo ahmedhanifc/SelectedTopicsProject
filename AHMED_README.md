@@ -32,15 +32,15 @@ Run the following command:
 
 In the root of the project, run: mkdir frame_root
 For one clip only:
-python prepare_cholecseg8k_for_sasvi.py \
-  --src-root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/dataset \
-  --dst-root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/frame_root \
+python helper_scripts/dataset_prep.py \
+  --src-root ./dataset \
+  --dst-root ./frame_root \
   --clip video01_28660
 
 For all clips:
-python prepare_cholecseg8k_for_sasvi.py \
-  --src-root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/dataset \
-  --dst-root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/frame_root
+python helper_scripts/dataset_prep.py \
+  --src-root ./dataset \
+  --dst-root ./frame_root
 
 
 # Run Inference (Assuming you are currently at root)
@@ -49,13 +49,13 @@ cd src/sam2
 python eval_sasvi.py \
   --device cpu \
   --sam2_cfg configs/sam2.1_hiera_l.yaml \
-  --sam2_checkpoint /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/src/sam2/sam2/checkpoints/sam2.1_hiera_large.pt \
-  --overseer_checkpoint /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/checkpoints/cholecseg8k_maskrcnn_best_val_f1.pth \
+  --sam2_checkpoint ./sam2/checkpoints/sam2.1_hiera_large.pt \
+  --overseer_checkpoint ../../checkpoints/cholecseg8k_maskrcnn_best_val_f1.pth \
   --overseer_type MaskRCNN \
   --dataset_type CHOLECSEG8K \
-  --base_video_dir /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/frame_root \
-  --output_mask_dir /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/output_masks \
-  --analysis_output_dir /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/analysis_output
+  --base_video_dir ../../frame_root \
+  --output_mask_dir ../../output_masks \
+  --analysis_output_dir ../../analysis_output
 
 
   # Output:
@@ -63,11 +63,69 @@ output_masks/video01_28660/
 
 # Error Report
 
+Prepare the ground-truth masks first:
+(optional) rm -rf ./gt_root/video01_28660
+
+python helper_scripts/prepare_cholecseg8k_gt_for_error_analysis.py \
+  --src-root ./dataset \
+  --dst-root ./gt_root \
+  --clip video01_28660 \
+  --symlink
+
+Then run the report:
+
 python analysis_tools/run_error_analysis.py \
-  --frames_root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/frame_root \
-  --pred_root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/output_masks \
-  --gt_root /PATH/TO/GROUND_TRUTH_MASKS \
-  --output_root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/analysis_output/report \
+  --frames_root ./frame_root \
+  --pred_root ./output_masks \
+  --gt_root ./gt_root \
+  --output_root ./analysis_output/report \
   --dataset_type CHOLECSEG8K \
-  --confidence_root /Users/ahmedhanif/Desktop/dev/SelectedTopics/project/SASVi/analysis_output/inference/confidence_maps
+  --confidence_root ./analysis_output/inference/confidence_maps \
+  --confidence_low_threshold 0.35 \
+  --confidence_medium_threshold 0.60
+
+**Setup**
+
+mkdir -p frame_root gt_root output_masks analysis_output
+
+python helper_scripts/dataset_prep.py \
+  --src-root ./dataset \
+  --dst-root ./frame_root \
+  --clip video01_28660
+
+python helper_scripts/prepare_cholecseg8k_gt_for_error_analysis.py \
+  --src-root ./dataset \
+  --dst-root ./gt_root \
+  --clip video01_28660 \
+  --symlink
+
+
+cd src/sam2
+
+python eval_sasvi.py \
+  --device cpu \
+  --sam2_cfg configs/sam2.1_hiera_l.yaml \
+  --sam2_checkpoint ./sam2/checkpoints/sam2.1_hiera_large.pt \
+  --overseer_checkpoint ../../checkpoints/cholecseg8k_maskrcnn_best_val_f1.pth \
+  --overseer_type MaskRCNN \
+  --dataset_type CHOLECSEG8K \
+  --base_video_dir ../../frame_root \
+  --output_mask_dir ../../output_masks \
+  --analysis_output_dir ../../analysis_output
+
+cd ../..
+
+
+Now Generate Report
+
+python analysis_tools/run_error_analysis.py \
+  --frames_root ./frame_root \
+  --pred_root ./output_masks \
+  --gt_root ./gt_root \
+  --output_root ./analysis_output/report \
+  --dataset_type CHOLECSEG8K \
+  --confidence_root ./analysis_output/inference/confidence_maps \
+  --confidence_low_threshold 0.35 \
+  --confidence_medium_threshold 0.60
+
 

@@ -205,3 +205,6 @@ analysis_output_disagreement_parallel/**
 **/confidence_maps/
 *.png
 gt_root/
+
+archive/
+analysis_output*/

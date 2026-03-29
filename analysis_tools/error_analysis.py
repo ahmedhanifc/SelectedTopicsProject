@@ -5,10 +5,22 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from .config import DatasetConfig
 from .inference_export import write_rows_to_csv
+from .visual_config import (
+    BACKGROUND_BLUR_RADIUS,
+    BACKGROUND_DIM_FACTOR,
+    ERROR_OVERLAY_ALPHA,
+    GROUND_TRUTH_OVERLAY_ALPHA,
+    HIGH_CONFIDENCE_SPACING,
+    LOW_CONFIDENCE_SPACING,
+    MEDIUM_CONFIDENCE_SPACING,
+    PATTERN_LINE_WIDTH_DIVISOR,
+    PATTERN_LINE_WIDTH_MIN,
+    PREDICTION_OVERLAY_ALPHA,
+)
 
 
 REPORT_COLUMNS = [
@@ -68,24 +80,30 @@ def load_dataset_mask(path: Path | str, dataset_config: DatasetConfig) -> np.nda
 
     if mask.ndim == 2:
         if dataset_config.rgb_label_map:
-            mapped = np.full(mask.shape, fill_value=255, dtype=np.uint8)
             scalar_map = {
                 rgb[0]: label
                 for rgb, label in dataset_config.rgb_label_map.items()
                 if rgb[0] == rgb[1] == rgb[2]
             }
-            for value, label in scalar_map.items():
-                mapped[mask == value] = label
-            if np.any(mapped != 255):
+            unique_values = set(np.unique(mask).tolist())
+            if unique_values and unique_values.issubset(set(scalar_map.keys())):
+                mapped = np.full(mask.shape, fill_value=255, dtype=np.uint8)
+                for value, label in scalar_map.items():
+                    mapped[mask == value] = label
                 return mapped
         return mask.astype(np.uint8)
 
     if mask.ndim == 3 and mask.shape[2] >= 3 and dataset_config.rgb_label_map:
         rgb = mask[:, :, :3].astype(np.uint8)
-        label_mask = np.full(rgb.shape[:2], fill_value=255, dtype=np.uint8)
-        for color, label in dataset_config.rgb_label_map.items():
-            label_mask[np.all(rgb == np.array(color, dtype=np.uint8), axis=-1)] = label
-        if np.any(label_mask != 255):
+        unique_colors = {
+            tuple(color.tolist())
+            for color in np.unique(rgb.reshape(-1, rgb.shape[-1]), axis=0)
+        }
+        known_colors = set(dataset_config.rgb_label_map.keys())
+        if unique_colors and unique_colors.issubset(known_colors):
+            label_mask = np.full(rgb.shape[:2], fill_value=255, dtype=np.uint8)
+            for color, label in dataset_config.rgb_label_map.items():
+                label_mask[np.all(rgb == np.array(color, dtype=np.uint8), axis=-1)] = label
             return label_mask
 
     return load_png_mask(path, dataset_config.palette)
@@ -233,6 +251,166 @@ def _blend(base: np.ndarray, overlay: np.ndarray, alpha: float) -> np.ndarray:
     return blended.astype(np.uint8)
 
 
+def _make_pattern_mask(shape_hw: tuple[int, int], spacing: int) -> np.ndarray:
+    height, width = shape_hw
+    yy, xx = np.indices((height, width))
+    line_width = max(PATTERN_LINE_WIDTH_MIN, spacing // PATTERN_LINE_WIDTH_DIVISOR)
+    return ((xx + yy) % spacing) < line_width
+
+
+def _apply_pattern_overlay(image: np.ndarray,
+                           region_mask: np.ndarray,
+                           color: np.ndarray,
+                           spacing: int) -> np.ndarray:
+    if not region_mask.any():
+        return image
+    pattern_mask = _make_pattern_mask(image.shape[:2], spacing=spacing)
+    mask = np.logical_and(region_mask, pattern_mask)
+    output = image.copy()
+    output[mask] = color
+    return output
+
+
+def _soften_image(image: np.ndarray,
+                  blur_radius: float = BACKGROUND_BLUR_RADIUS,
+                  dim_factor: float = BACKGROUND_DIM_FACTOR) -> np.ndarray:
+    softened = Image.fromarray(image.astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    softened_np = np.array(softened, dtype=np.float32)
+    softened_np *= dim_factor
+    return np.clip(softened_np, 0, 255).astype(np.uint8)
+
+
+def _stack_confidence_rgb(confidence_map: np.ndarray | None, image_shape: tuple[int, int, int]) -> np.ndarray:
+    if confidence_map is None:
+        return np.zeros(image_shape, dtype=np.uint8)
+    confidence_uint8 = (np.clip(confidence_map, 0.0, 1.0) * 255).astype(np.uint8)
+    return np.stack([confidence_uint8] * 3, axis=-1)
+
+
+def _draw_label(draw: ImageDraw.ImageDraw, x: int, y: int, text: str, font: ImageFont.ImageFont) -> None:
+    bbox = draw.textbbox((x, y), text, font=font)
+    draw.rectangle((bbox[0] - 4, bbox[1] - 2, bbox[2] + 4, bbox[3] + 2), fill=(0, 0, 0))
+    draw.text((x, y), text, fill=(255, 255, 255), font=font)
+
+
+def _add_panel_titles(canvas: np.ndarray, labels: list[tuple[str, tuple[int, int]]]) -> np.ndarray:
+    image = Image.fromarray(canvas)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    for text, (x, y) in labels:
+        _draw_label(draw, x, y, text, font)
+    return np.array(image)
+
+
+def _make_legend_strip(width: int,
+                       has_confidence: bool,
+                       low_threshold: float,
+                       medium_threshold: float) -> np.ndarray:
+    font = ImageFont.load_default()
+    legend_height = 100 if has_confidence else 56
+    legend = Image.new("RGB", (width, legend_height), color=(24, 24, 24))
+    draw = ImageDraw.Draw(legend)
+    draw.text((12, 8), "Legend", fill=(255, 255, 255), font=font)
+
+    error_items = [
+        ("False positive", (255, 64, 64)),
+        ("False negative", (64, 128, 255)),
+        ("Class confusion", (255, 196, 64)),
+        ("Correct / no error", (0, 0, 0)),
+    ]
+    x = 12
+    y = 28
+    for label, color in error_items:
+        draw.rectangle((x, y, x + 14, y + 14), fill=color, outline=(255, 255, 255))
+        draw.text((x + 22, y), label, fill=(235, 235, 235), font=font)
+        x += 150
+
+    if has_confidence:
+        y = 52
+        draw.text((12, y), "Confidence patterns on correct / no-error pixels:", fill=(255, 255, 255), font=font)
+        x = 250
+        draw.rectangle((x, y, x + 34, y + 14), fill=(0, 0, 0), outline=(255, 255, 255))
+        for offset in range(-14, 35, 4):
+            draw.line((x + offset, y, x + offset + 14, y + 14), fill=(255, 255, 255), width=1)
+        draw.text((x + 42, y), f"low <= {low_threshold:.2f}", fill=(235, 235, 235), font=font)
+
+        x += 150
+        draw.rectangle((x, y, x + 34, y + 14), fill=(0, 0, 0), outline=(255, 255, 255))
+        for offset in range(-14, 35, 7):
+            draw.line((x + offset, y, x + offset + 14, y + 14), fill=(255, 255, 255), width=1)
+        draw.text((x + 42, y), f"{low_threshold:.2f} < medium <= {medium_threshold:.2f}", fill=(235, 235, 235), font=font)
+
+        x += 210
+        draw.rectangle((x, y, x + 34, y + 14), fill=(0, 0, 0), outline=(255, 255, 255))
+        for offset in range(-14, 35, 10):
+            draw.line((x + offset, y, x + offset + 14, y + 14), fill=(180, 180, 180), width=1)
+        draw.text((x + 42, y), f"high > {medium_threshold:.2f}", fill=(235, 235, 235), font=font)
+
+    return np.array(legend)
+
+
+def _confidence_band_masks(confidence_map: np.ndarray,
+                           region_mask: np.ndarray,
+                           low_threshold: float,
+                           medium_threshold: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    low_confidence_mask = np.logical_and(region_mask, confidence_map <= low_threshold)
+    medium_confidence_mask = np.logical_and(
+        region_mask,
+        np.logical_and(confidence_map > low_threshold, confidence_map <= medium_threshold),
+    )
+    high_confidence_mask = np.logical_and(region_mask, confidence_map > medium_threshold)
+    return low_confidence_mask, medium_confidence_mask, high_confidence_mask
+
+
+def _annotate_error_map(base_canvas: np.ndarray,
+                        soften_base_canvas: bool,
+                        error_map: np.ndarray,
+                        confidence_map: np.ndarray | None,
+                        valid_mask: np.ndarray,
+                        has_confidence: bool,
+                        low_threshold: float,
+                        medium_threshold: float) -> np.ndarray:
+    base_canvas = base_canvas[:, :, :3].astype(np.uint8)
+    background = _soften_image(base_canvas) if soften_base_canvas else base_canvas.copy()
+    annotated_map = background.copy()
+    error_pixels = error_map.any(axis=2)
+    if error_pixels.any():
+        annotated_map[error_pixels] = _blend(background[error_pixels], error_map[error_pixels], alpha=ERROR_OVERLAY_ALPHA)
+    if confidence_map is not None:
+        correct_region_mask = np.logical_and(valid_mask, ~error_map.any(axis=2))
+        low_confidence_mask, medium_confidence_mask, high_confidence_mask = _confidence_band_masks(
+            confidence_map=confidence_map,
+            region_mask=correct_region_mask,
+            low_threshold=low_threshold,
+            medium_threshold=medium_threshold,
+        )
+        annotated_map = _apply_pattern_overlay(
+            annotated_map,
+            region_mask=high_confidence_mask,
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=HIGH_CONFIDENCE_SPACING,
+        )
+        annotated_map = _apply_pattern_overlay(
+            annotated_map,
+            region_mask=medium_confidence_mask,
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=MEDIUM_CONFIDENCE_SPACING,
+        )
+        annotated_map = _apply_pattern_overlay(
+            annotated_map,
+            region_mask=low_confidence_mask,
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=LOW_CONFIDENCE_SPACING,
+        )
+    legend = _make_legend_strip(
+        width=annotated_map.shape[1],
+        has_confidence=has_confidence,
+        low_threshold=low_threshold,
+        medium_threshold=medium_threshold,
+    )
+    return np.concatenate([annotated_map, legend], axis=0)
+
+
 def _build_confidence_stripe_mask(shape_hw: tuple[int, int],
                                   confidence_map: np.ndarray,
                                   min_period: int = 4,
@@ -270,31 +448,104 @@ def _apply_confidence_pattern(pred_mask: np.ndarray,
 
 
 def _make_overlay(image: np.ndarray,
+                  error_canvas: np.ndarray,
+                  base_label: str,
+                  soften_error_canvas: bool,
                   pred_rgb: np.ndarray,
-                  pred_pattern_rgb: np.ndarray,
                   gt_rgb: np.ndarray,
                   error_map: np.ndarray,
-                  confidence_map: np.ndarray | None) -> np.ndarray:
+                  confidence_map: np.ndarray | None,
+                  valid_mask: np.ndarray,
+                  low_confidence_threshold: float,
+                  medium_confidence_threshold: float) -> np.ndarray:
     image = image[:, :, :3].astype(np.uint8)
-    pred_overlay = _blend(image, pred_rgb, alpha=0.45)
-    pred_pattern_overlay = _blend(image, pred_pattern_rgb, alpha=0.55)
-    gt_overlay = _blend(image, gt_rgb, alpha=0.45)
-    error_overlay = _blend(image, error_map, alpha=0.60)
+    error_canvas = error_canvas[:, :, :3].astype(np.uint8)
+    pred_overlay = _blend(image, pred_rgb, alpha=PREDICTION_OVERLAY_ALPHA)
+    gt_overlay = _blend(image, gt_rgb, alpha=GROUND_TRUTH_OVERLAY_ALPHA)
+    error_background = _soften_image(error_canvas) if soften_error_canvas else error_canvas.copy()
+    error_overlay = error_background.copy()
+    error_pixels = error_map.any(axis=2)
+    if error_pixels.any():
+        error_overlay[error_pixels] = _blend(error_background[error_pixels], error_map[error_pixels], alpha=ERROR_OVERLAY_ALPHA)
 
-    if confidence_map is None:
-        confidence_rgb = np.zeros_like(image)
-    else:
-        confidence_uint8 = (np.clip(confidence_map, 0.0, 1.0) * 255).astype(np.uint8)
-        confidence_rgb = np.stack([confidence_uint8] * 3, axis=-1)
+    confidence_rgb = _stack_confidence_rgb(confidence_map, image.shape)
 
-    top = np.concatenate([image, pred_overlay, pred_pattern_overlay], axis=1)
-    bottom = np.concatenate([gt_overlay, error_overlay, pred_pattern_rgb], axis=1)
     if confidence_map is not None:
-        confidence_panel = np.concatenate([confidence_rgb, confidence_rgb, confidence_rgb], axis=1)
+        confidence_region_mask = valid_mask.copy()
+        low_confidence_mask, medium_confidence_mask, high_confidence_mask = _confidence_band_masks(
+            confidence_map=confidence_map,
+            region_mask=confidence_region_mask,
+            low_threshold=low_confidence_threshold,
+            medium_threshold=medium_confidence_threshold,
+        )
+        pred_overlay = _apply_pattern_overlay(
+            pred_overlay,
+            region_mask=high_confidence_mask,
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=HIGH_CONFIDENCE_SPACING,
+        )
+        pred_overlay = _apply_pattern_overlay(
+            pred_overlay,
+            region_mask=medium_confidence_mask,
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=MEDIUM_CONFIDENCE_SPACING,
+        )
+        pred_overlay = _apply_pattern_overlay(
+            pred_overlay,
+            region_mask=low_confidence_mask,
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=LOW_CONFIDENCE_SPACING,
+        )
+        correct_region_mask = np.logical_and(valid_mask, ~error_map.any(axis=2))
+        low_correct_confidence_mask, medium_correct_confidence_mask, high_correct_confidence_mask = _confidence_band_masks(
+            confidence_map=confidence_map,
+            region_mask=correct_region_mask,
+            low_threshold=low_confidence_threshold,
+            medium_threshold=medium_confidence_threshold,
+        )
+        error_overlay = _apply_pattern_overlay(
+            error_overlay,
+            region_mask=high_correct_confidence_mask,
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=HIGH_CONFIDENCE_SPACING,
+        )
+        error_overlay = _apply_pattern_overlay(
+            error_overlay,
+            region_mask=medium_correct_confidence_mask,
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=MEDIUM_CONFIDENCE_SPACING,
+        )
+        error_overlay = _apply_pattern_overlay(
+            error_overlay,
+            region_mask=low_correct_confidence_mask,
+            color=np.array([255, 255, 255], dtype=np.uint8),
+            spacing=LOW_CONFIDENCE_SPACING,
+        )
+
+    top = np.concatenate([image, pred_overlay], axis=1)
+    bottom = np.concatenate([gt_overlay, error_overlay], axis=1)
+    if confidence_map is not None:
+        confidence_panel = np.concatenate([confidence_rgb, confidence_rgb], axis=1)
         overlay = np.concatenate([top, bottom, confidence_panel], axis=0)
     else:
         overlay = np.concatenate([top, bottom], axis=0)
-    return overlay
+    overlay = _add_panel_titles(
+        overlay,
+        labels=[
+            (base_label, (10, 8)),
+            ("Prediction overlay", (image.shape[1] + 10, 8)),
+            ("Ground truth overlay", (10, image.shape[0] + 8)),
+            ("Error overlay", (image.shape[1] + 10, image.shape[0] + 8)),
+            *((("Confidence map", (10, image.shape[0] * 2 + 8)),) if confidence_map is not None else ()),
+        ],
+    )
+    legend = _make_legend_strip(
+        width=overlay.shape[1],
+        has_confidence=confidence_map is not None,
+        low_threshold=low_confidence_threshold,
+        medium_threshold=medium_confidence_threshold,
+    )
+    return np.concatenate([overlay, legend], axis=0)
 
 
 def _frame_sort_key(path: Path) -> tuple[int, str]:
@@ -313,7 +564,9 @@ def analyze_predictions(frame_root: Path,
                         confidence_root: Path | None = None,
                         pred_mask_suffix: str = "_rgb_mask.png",
                         gt_mask_suffix: str = "_rgb_mask.png",
-                        image_suffix: str = ".jpg") -> dict[str, Any]:
+                        image_suffix: str = ".jpg",
+                        low_confidence_threshold: float = 0.35,
+                        medium_confidence_threshold: float = 0.60) -> dict[str, Any]:
     report_rows: list[dict[str, Any]] = []
     summary: dict[str, Any] = {
         "dataset_type": dataset_config.dataset_type,
@@ -365,6 +618,10 @@ def analyze_predictions(frame_root: Path,
             if ignore_index is not None:
                 valid_mask &= gt_mask != ignore_index
 
+            valid_pixels = int(valid_mask.sum())
+            if valid_pixels == 0:
+                continue
+
             temporal_iou_prev = ""
             if prev_pred_mask is not None:
                 temporal_intersection = np.logical_and(prev_pred_mask == pred_mask, valid_mask).sum()
@@ -383,8 +640,54 @@ def analyze_predictions(frame_root: Path,
                 ignore_index=dataset_config.ignore_index,
             )
             gt_rgb = _colorize_mask(gt_mask, dataset_config.palette, dataset_config.ignore_index)
+            mask_backdrop = gt_rgb.copy()
             error_map = _build_error_map(pred_mask, gt_mask, valid_mask, dataset_config.background_index)
-            overlay = _make_overlay(image, pred_rgb, pred_pattern_rgb, gt_rgb, error_map, confidence_map)
+            overlay = _make_overlay(
+                image=image,
+                error_canvas=image,
+                base_label="Input image",
+                soften_error_canvas=True,
+                pred_rgb=pred_rgb,
+                gt_rgb=gt_rgb,
+                error_map=error_map,
+                confidence_map=confidence_map,
+                valid_mask=valid_mask,
+                low_confidence_threshold=low_confidence_threshold,
+                medium_confidence_threshold=medium_confidence_threshold,
+            )
+            overlay_mask = _make_overlay(
+                image=image,
+                error_canvas=mask_backdrop,
+                base_label="Input image",
+                soften_error_canvas=False,
+                pred_rgb=pred_rgb,
+                gt_rgb=gt_rgb,
+                error_map=error_map,
+                confidence_map=confidence_map,
+                valid_mask=valid_mask,
+                low_confidence_threshold=low_confidence_threshold,
+                medium_confidence_threshold=medium_confidence_threshold,
+            )
+            error_map_annotated = _annotate_error_map(
+                base_canvas=image,
+                soften_base_canvas=True,
+                error_map=error_map,
+                confidence_map=confidence_map,
+                valid_mask=valid_mask,
+                has_confidence=confidence_map is not None,
+                low_threshold=low_confidence_threshold,
+                medium_threshold=medium_confidence_threshold,
+            )
+            error_map_mask_annotated = _annotate_error_map(
+                base_canvas=mask_backdrop,
+                soften_base_canvas=False,
+                error_map=error_map,
+                confidence_map=confidence_map,
+                valid_mask=valid_mask,
+                has_confidence=confidence_map is not None,
+                low_threshold=low_confidence_threshold,
+                medium_threshold=medium_confidence_threshold,
+            )
 
             artifact_dir = output_root / "artifacts" / video_name
             artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -392,15 +695,19 @@ def analyze_predictions(frame_root: Path,
             pred_pattern_artifact_path = artifact_dir / f"{frame_name}_pred_confidence_pattern.png"
             gt_artifact_path = artifact_dir / f"{frame_name}_gt_rgb.png"
             error_artifact_path = artifact_dir / f"{frame_name}_error_map.png"
+            error_mask_artifact_path = artifact_dir / f"{frame_name}_error_map_mask.png"
             overlay_artifact_path = artifact_dir / f"{frame_name}_overlay.png"
+            overlay_mask_artifact_path = artifact_dir / f"{frame_name}_overlay_mask.png"
             image_artifact_path = artifact_dir / f"{frame_name}_image.png"
 
             Image.fromarray(image).save(image_artifact_path)
             Image.fromarray(pred_rgb).save(pred_artifact_path)
             Image.fromarray(pred_pattern_rgb).save(pred_pattern_artifact_path)
             Image.fromarray(gt_rgb).save(gt_artifact_path)
-            Image.fromarray(error_map).save(error_artifact_path)
+            Image.fromarray(error_map_annotated).save(error_artifact_path)
+            Image.fromarray(error_map_mask_annotated).save(error_mask_artifact_path)
             Image.fromarray(overlay).save(overlay_artifact_path)
+            Image.fromarray(overlay_mask).save(overlay_mask_artifact_path)
 
             confidence_stats = {
                 "confidence_mean": "",

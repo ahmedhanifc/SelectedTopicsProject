@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 
 
-FRAME_PATTERN = re.compile(r"frame_(\d+)_endo_color_mask\.png$")
+FRAME_PATTERN = re.compile(r"frame_(\d+)_endo_watershed_mask\.png$")
 
 
 def frame_sort_key(path: Path) -> int:
@@ -22,15 +22,15 @@ def find_clip_dirs(src_root: Path) -> list[Path]:
     clip_dirs: list[Path] = []
     for video_dir in sorted(path for path in src_root.iterdir() if path.is_dir()):
         for clip_dir in sorted(path for path in video_dir.iterdir() if path.is_dir()):
-            if any(clip_dir.glob("frame_*_endo_color_mask.png")):
+            if any(clip_dir.glob("frame_*_endo_watershed_mask.png")):
                 clip_dirs.append(clip_dir)
     return clip_dirs
 
 
 def export_clip_gt(src_clip_dir: Path, dst_clip_dir: Path, overwrite: bool, symlink: bool) -> int:
-    gt_paths = sorted(src_clip_dir.glob("frame_*_endo_color_mask.png"), key=frame_sort_key)
+    gt_paths = sorted(src_clip_dir.glob("frame_*_endo_watershed_mask.png"), key=frame_sort_key)
     if not gt_paths:
-        print(f"Skipping {src_clip_dir}: no '*_endo_color_mask.png' files found")
+        print(f"Skipping {src_clip_dir}: no '*_endo_watershed_mask.png' files found")
         return 0
 
     dst_clip_dir.mkdir(parents=True, exist_ok=True)
