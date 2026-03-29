@@ -25,18 +25,18 @@ Most useful knobs:
 """
 
 # Source-image background used in error_map and error overlay panels.
-BACKGROUND_BLUR_RADIUS = 1.5
+BACKGROUND_BLUR_RADIUS = 3.0
 BACKGROUND_DIM_FACTOR = 0.8
 
 # Strength of error colors when blended over the softened source image.
 ERROR_OVERLAY_ALPHA = 0.75
 
 # Confidence hatch settings.
-LOW_CONFIDENCE_SPACING = 5
-MEDIUM_CONFIDENCE_SPACING = 8
-HIGH_CONFIDENCE_SPACING = 12
+LOW_CONFIDENCE_SPACING = 7
+MEDIUM_CONFIDENCE_SPACING = 11
+HIGH_CONFIDENCE_SPACING = 16
 PATTERN_LINE_WIDTH_MIN = 1
-PATTERN_LINE_WIDTH_DIVISOR = 2
+PATTERN_LINE_WIDTH_DIVISOR = 4
 
 # Mask/prediction overlay transparency in the combined panel.
 PREDICTION_OVERLAY_ALPHA = 0.45
