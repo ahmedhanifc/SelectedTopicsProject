@@ -119,7 +119,7 @@ python parallel_disagreement_sasvi.py \
   --dataset_type CHOLECSEG8K \
   --base_video_dir "C:\Users\Test\Desktop\SelectedTopicsProject\frame_root" \
   --enable_disagreement_gate \
-  --disagreement_iou_threshold 0.5 \
+  --disagreement_iou_threshold 0.95 \
   --disagreement_bad_frames 2
 ```
 
@@ -135,7 +135,7 @@ python time_original_disagreement_sasvi.py \
   --dataset_type CHOLECSEG8K \
   --base_video_dir "C:\Users\Test\Desktop\SelectedTopicsProject\frame_root" \
   --enable_disagreement_gate \
-  --disagreement_iou_threshold 0.5 \
+  --disagreement_iou_threshold 0.95 \
   --disagreement_bad_frames 2
 ```
 
