@@ -12,8 +12,8 @@ from tqdm import tqdm
 from transformers import DetrForSegmentation, Mask2FormerForUniversalSegmentation
 
 CURRENT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = CURRENT_DIR.parent.parent
-sys.path.append(str(REPO_ROOT))
+PYTHON_ROOT = CURRENT_DIR.parent.parent.parent
+sys.path.append(str(PYTHON_ROOT))
 
 from sam2.build_sam import build_sam2_video_predictor
 from analysis_tools.inference_export import INFERENCE_METADATA_COLUMNS, write_rows_to_csv

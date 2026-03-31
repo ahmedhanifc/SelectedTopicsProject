@@ -1,5 +1,7 @@
 data/
 dataset/
+videos/
+public/
 frame_root/
 gt_root/
 output_masks/
@@ -17,6 +19,10 @@ src/sam2/eval_sasvi_old.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
+node_modules/
+.next/
+dist/
+*.tsbuildinfo
 *.py[cod]
 *$py.class
 
@@ -237,5 +243,3 @@ push/
 # # !push/**/analysis_output/report_raw/*.csv
 # # !push/**/analysis_output/report_raw/*.md
 # # !push/**/analysis_output/report_raw/*.json
-
-

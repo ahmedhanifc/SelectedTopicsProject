@@ -7,8 +7,9 @@ import sys
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parent
-SAM2_DIR = REPO_ROOT / "src" / "sam2"
+PYTHON_ROOT = Path(__file__).resolve().parent
+APP_ROOT = PYTHON_ROOT.parent
+SAM2_DIR = PYTHON_ROOT / "src" / "sam2"
 EVAL_SCRIPT = SAM2_DIR / "eval_sasvi.py"
 
 
@@ -64,7 +65,7 @@ def resolve_repo_path(value: str | None) -> str | None:
     path = Path(value)
     if path.is_absolute():
         return str(path)
-    return str((REPO_ROOT / path).resolve())
+    return str((APP_ROOT / path).resolve())
 
 
 def resolve_sam2_cfg(value: str | None) -> str | None:
@@ -84,7 +85,7 @@ def resolve_sam2_cfg(value: str | None) -> str | None:
 
 def default_overseer_checkpoint(dataset_type: str) -> str | None:
     defaults = {
-        "CHOLECSEG8K": REPO_ROOT / "checkpoints" / "cholecseg8k_maskrcnn_best_val_f1.pth",
+        "CHOLECSEG8K": APP_ROOT / "checkpoints" / "cholecseg8k_maskrcnn_best_val_f1.pth",
     }
     checkpoint = defaults.get(dataset_type)
     return str(checkpoint) if checkpoint is not None else None
@@ -119,7 +120,7 @@ def base_defaults() -> dict[str, object]:
         "overseer_type": "MaskRCNN",
         "overseer_checkpoint": None,
         "nnunet_checkpoint": None,
-        "base_video_dir": str((REPO_ROOT / "dataset").resolve()),
+        "base_video_dir": str((APP_ROOT / "dataset").resolve()),
         "output_mask_dir": None,
         "analysis_output_dir": None,
         "gt_root_dir": None,
@@ -252,9 +253,9 @@ def finalize_config(args: argparse.Namespace) -> dict[str, object]:
 
     run_name = build_run_name(config, args.run_name)
     if config.get("output_mask_dir") is None:
-        config["output_mask_dir"] = str((REPO_ROOT / f"output_masks_{run_name}").resolve())
+        config["output_mask_dir"] = str((APP_ROOT / f"output_masks_{run_name}").resolve())
     if config.get("analysis_output_dir") is None:
-        config["analysis_output_dir"] = str((REPO_ROOT / f"analysis_output_{run_name}").resolve())
+        config["analysis_output_dir"] = str((APP_ROOT / f"analysis_output_{run_name}").resolve())
 
     return config
 
