@@ -31,12 +31,15 @@ BACKGROUND_DIM_FACTOR = 0.8
 # Strength of error colors when blended over the softened source image.
 ERROR_OVERLAY_ALPHA = 0.75
 
-# Confidence hatch settings.
+# Confidence pattern settings.
 LOW_CONFIDENCE_SPACING = 10
 MEDIUM_CONFIDENCE_SPACING = 14
 HIGH_CONFIDENCE_SPACING = 19
 PATTERN_LINE_WIDTH_MIN = 1
 PATTERN_LINE_WIDTH_DIVISOR = 4
+POLKA_DOT_RADIUS = 2
+TRIANGLE_SIDE = 8
+TRIANGLE_TILE_SIZE = 30
 
 # Mask/prediction overlay transparency in the combined panel.
 PREDICTION_OVERLAY_ALPHA = 0.45

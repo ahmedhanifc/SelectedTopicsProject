@@ -20,7 +20,10 @@ from .visual_config import (
     MEDIUM_CONFIDENCE_SPACING,
     PATTERN_LINE_WIDTH_DIVISOR,
     PATTERN_LINE_WIDTH_MIN,
+    POLKA_DOT_RADIUS,
     PREDICTION_OVERLAY_ALPHA,
+    TRIANGLE_SIDE,
+    TRIANGLE_TILE_SIZE,
 )
 
 
@@ -284,24 +287,101 @@ def _blend(base: np.ndarray, overlay: np.ndarray, alpha: float) -> np.ndarray:
     return blended.astype(np.uint8)
 
 
-def _make_pattern_mask(shape_hw: tuple[int, int], spacing: int) -> np.ndarray:
+def _make_pattern_mask(shape_hw: tuple[int, int], spacing: int, pattern_name: str) -> np.ndarray:
     height, width = shape_hw
     yy, xx = np.indices((height, width))
-    line_width = max(PATTERN_LINE_WIDTH_MIN, spacing // PATTERN_LINE_WIDTH_DIVISOR)
-    return ((xx + yy) % spacing) < line_width
+    if pattern_name == "stripes":
+        line_width = max(PATTERN_LINE_WIDTH_MIN, spacing // PATTERN_LINE_WIDTH_DIVISOR)
+        return ((xx + yy) % spacing) < line_width
+
+    if pattern_name == "polka_dots":
+        center = spacing // 2
+        radius = min(POLKA_DOT_RADIUS, max(1, spacing // 3))
+        dot_x = (xx % spacing) - center
+        dot_y = (yy % spacing) - center
+        return (dot_x * dot_x + dot_y * dot_y) <= (radius * radius)
+
+    if pattern_name == "triangles":
+        tile = max(TRIANGLE_TILE_SIZE, spacing * 2)
+        tile_x = xx // tile
+        tile_y = yy // tile
+        local_x = xx % tile
+        local_y = yy % tile
+
+        # Deterministic per-tile jitter so triangles feel scattered instead of gridded.
+        seed = (tile_x * 73 + tile_y * 151 + 17) % 997
+        offset_x = seed % max(1, tile - TRIANGLE_SIDE - 2)
+        offset_y = (seed * 7) % max(1, tile - TRIANGLE_SIDE - 2)
+
+        triangle_height = TRIANGLE_SIDE
+        base_x = 1 + offset_x
+        base_y = 1 + offset_y
+        rel_x = local_x - base_x
+        rel_y = local_y - base_y
+
+        inside_height = np.logical_and(rel_y >= 0, rel_y <= triangle_height)
+        half_width = ((triangle_height - rel_y) / triangle_height) * (triangle_height / 2.0)
+        center_x = triangle_height / 2.0
+        inside_width = np.abs(rel_x - center_x) <= half_width
+        return np.logical_and(inside_height, inside_width)
+
+    raise ValueError(f"Unsupported pattern: {pattern_name}")
 
 
 def _apply_pattern_overlay(image: np.ndarray,
                            region_mask: np.ndarray,
                            color: np.ndarray,
-                           spacing: int) -> np.ndarray:
+                           spacing: int,
+                           pattern_name: str) -> np.ndarray:
     if not region_mask.any():
         return image
-    pattern_mask = _make_pattern_mask(image.shape[:2], spacing=spacing)
+    pattern_mask = _make_pattern_mask(image.shape[:2], spacing=spacing, pattern_name=pattern_name)
     mask = np.logical_and(region_mask, pattern_mask)
     output = image.copy()
     output[mask] = color
     return output
+
+
+def _apply_confidence_band_patterns(
+    image: np.ndarray,
+    confidence_map: np.ndarray | None,
+    region_mask: np.ndarray,
+    low_threshold: float,
+    medium_threshold: float,
+    pattern_color: np.ndarray,
+) -> np.ndarray:
+    if confidence_map is None or not region_mask.any():
+        return image
+
+    low_confidence_mask, medium_confidence_mask, high_confidence_mask = _confidence_band_masks(
+        confidence_map=confidence_map,
+        region_mask=region_mask,
+        low_threshold=low_threshold,
+        medium_threshold=medium_threshold,
+    )
+
+    patterned = _apply_pattern_overlay(
+        image,
+        region_mask=high_confidence_mask,
+        color=pattern_color,
+        spacing=HIGH_CONFIDENCE_SPACING,
+        pattern_name="stripes",
+    )
+    patterned = _apply_pattern_overlay(
+        patterned,
+        region_mask=medium_confidence_mask,
+        color=pattern_color,
+        spacing=MEDIUM_CONFIDENCE_SPACING,
+        pattern_name="polka_dots",
+    )
+    patterned = _apply_pattern_overlay(
+        patterned,
+        region_mask=low_confidence_mask,
+        color=pattern_color,
+        spacing=LOW_CONFIDENCE_SPACING,
+        pattern_name="triangles",
+    )
+    return patterned
 
 
 def _soften_image(image: np.ndarray,
@@ -400,7 +480,6 @@ def _annotate_error_map(base_canvas: np.ndarray,
                         error_map: np.ndarray,
                         confidence_map: np.ndarray | None,
                         valid_mask: np.ndarray,
-                        has_confidence: bool,
                         low_threshold: float,
                         medium_threshold: float) -> np.ndarray:
     base_canvas = base_canvas[:, :, :3].astype(np.uint8)
@@ -409,39 +488,15 @@ def _annotate_error_map(base_canvas: np.ndarray,
     error_pixels = error_map.any(axis=2)
     if error_pixels.any():
         annotated_map[error_pixels] = _blend(background[error_pixels], error_map[error_pixels], alpha=ERROR_OVERLAY_ALPHA)
-    if confidence_map is not None:
-        correct_region_mask = np.logical_and(valid_mask, ~error_map.any(axis=2))
-        low_confidence_mask, medium_confidence_mask, high_confidence_mask = _confidence_band_masks(
-            confidence_map=confidence_map,
-            region_mask=correct_region_mask,
-            low_threshold=low_threshold,
-            medium_threshold=medium_threshold,
-        )
-        annotated_map = _apply_pattern_overlay(
-            annotated_map,
-            region_mask=high_confidence_mask,
-            color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=HIGH_CONFIDENCE_SPACING,
-        )
-        annotated_map = _apply_pattern_overlay(
-            annotated_map,
-            region_mask=medium_confidence_mask,
-            color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=MEDIUM_CONFIDENCE_SPACING,
-        )
-        annotated_map = _apply_pattern_overlay(
-            annotated_map,
-            region_mask=low_confidence_mask,
-            color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=LOW_CONFIDENCE_SPACING,
-        )
-    legend = _make_legend_strip(
-        width=annotated_map.shape[1],
-        has_confidence=has_confidence,
+    annotated_map = _apply_confidence_band_patterns(
+        annotated_map,
+        confidence_map=confidence_map,
+        region_mask=np.logical_and(valid_mask, ~error_map.any(axis=2)),
         low_threshold=low_threshold,
         medium_threshold=medium_threshold,
+        pattern_color=np.array([255, 255, 255], dtype=np.uint8),
     )
-    return np.concatenate([annotated_map, legend], axis=0)
+    return annotated_map
 
 
 def _build_confidence_stripe_mask(shape_hw: tuple[int, int],
@@ -461,23 +516,28 @@ def _build_confidence_stripe_mask(shape_hw: tuple[int, int],
 def _apply_confidence_pattern(pred_mask: np.ndarray,
                               pred_rgb: np.ndarray,
                               confidence_map: np.ndarray | None,
+                              low_confidence_threshold: float,
+                              medium_confidence_threshold: float,
                               background_index: int | None,
                               ignore_index: int | None) -> np.ndarray:
     if confidence_map is None:
         return pred_rgb.copy()
 
     patterned = pred_rgb.copy()
-    stripe_mask = _build_confidence_stripe_mask(pred_mask.shape, confidence_map)
-
     foreground_mask = np.ones_like(pred_mask, dtype=bool)
     if background_index is not None:
         foreground_mask &= pred_mask != background_index
     if ignore_index is not None:
         foreground_mask &= pred_mask != ignore_index
 
-    active_stripes = np.logical_and(foreground_mask, stripe_mask)
-    patterned[active_stripes] = np.clip(patterned[active_stripes].astype(np.float32) * 0.25, 0, 255).astype(np.uint8)
-    return patterned
+    return _apply_confidence_band_patterns(
+        patterned,
+        confidence_map=confidence_map,
+        region_mask=foreground_mask,
+        low_threshold=low_confidence_threshold,
+        medium_threshold=medium_confidence_threshold,
+        pattern_color=np.array([255, 255, 255], dtype=np.uint8),
+    )
 
 
 def _make_overlay(image: np.ndarray,
@@ -504,55 +564,21 @@ def _make_overlay(image: np.ndarray,
     confidence_rgb = _stack_confidence_rgb(confidence_map, image.shape)
 
     if confidence_map is not None:
-        confidence_region_mask = valid_mask.copy()
-        low_confidence_mask, medium_confidence_mask, high_confidence_mask = _confidence_band_masks(
+        pred_overlay = _apply_confidence_band_patterns(
+            pred_overlay,
             confidence_map=confidence_map,
-            region_mask=confidence_region_mask,
+            region_mask=valid_mask.copy(),
             low_threshold=low_confidence_threshold,
             medium_threshold=medium_confidence_threshold,
+            pattern_color=np.array([255, 255, 255], dtype=np.uint8),
         )
-        pred_overlay = _apply_pattern_overlay(
-            pred_overlay,
-            region_mask=high_confidence_mask,
-            color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=HIGH_CONFIDENCE_SPACING,
-        )
-        pred_overlay = _apply_pattern_overlay(
-            pred_overlay,
-            region_mask=medium_confidence_mask,
-            color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=MEDIUM_CONFIDENCE_SPACING,
-        )
-        pred_overlay = _apply_pattern_overlay(
-            pred_overlay,
-            region_mask=low_confidence_mask,
-            color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=LOW_CONFIDENCE_SPACING,
-        )
-        correct_region_mask = np.logical_and(valid_mask, ~error_map.any(axis=2))
-        low_correct_confidence_mask, medium_correct_confidence_mask, high_correct_confidence_mask = _confidence_band_masks(
+        error_overlay = _apply_confidence_band_patterns(
+            error_overlay,
             confidence_map=confidence_map,
-            region_mask=correct_region_mask,
+            region_mask=np.logical_and(valid_mask, ~error_map.any(axis=2)),
             low_threshold=low_confidence_threshold,
             medium_threshold=medium_confidence_threshold,
-        )
-        error_overlay = _apply_pattern_overlay(
-            error_overlay,
-            region_mask=high_correct_confidence_mask,
-            color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=HIGH_CONFIDENCE_SPACING,
-        )
-        error_overlay = _apply_pattern_overlay(
-            error_overlay,
-            region_mask=medium_correct_confidence_mask,
-            color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=MEDIUM_CONFIDENCE_SPACING,
-        )
-        error_overlay = _apply_pattern_overlay(
-            error_overlay,
-            region_mask=low_correct_confidence_mask,
-            color=np.array([255, 255, 255], dtype=np.uint8),
-            spacing=LOW_CONFIDENCE_SPACING,
+            pattern_color=np.array([255, 255, 255], dtype=np.uint8),
         )
 
     top = np.concatenate([image, pred_overlay], axis=1)
@@ -572,13 +598,7 @@ def _make_overlay(image: np.ndarray,
             *((("Confidence map", (10, image.shape[0] * 2 + 8)),) if confidence_map is not None else ()),
         ],
     )
-    legend = _make_legend_strip(
-        width=overlay.shape[1],
-        has_confidence=confidence_map is not None,
-        low_threshold=low_confidence_threshold,
-        medium_threshold=medium_confidence_threshold,
-    )
-    return np.concatenate([overlay, legend], axis=0)
+    return overlay
 
 
 def _frame_sort_key(path: Path) -> tuple[int, str]:
@@ -925,6 +945,8 @@ def analyze_predictions(frame_root: Path,
                 pred_mask=pred_mask,
                 pred_rgb=pred_rgb,
                 confidence_map=confidence_map,
+                low_confidence_threshold=low_confidence_threshold,
+                medium_confidence_threshold=medium_confidence_threshold,
                 background_index=dataset_config.background_index,
                 ignore_index=dataset_config.ignore_index,
             )
@@ -963,7 +985,6 @@ def analyze_predictions(frame_root: Path,
                 error_map=error_map,
                 confidence_map=confidence_map,
                 valid_mask=valid_mask,
-                has_confidence=confidence_map is not None,
                 low_threshold=low_confidence_threshold,
                 medium_threshold=medium_confidence_threshold,
             )
@@ -973,7 +994,6 @@ def analyze_predictions(frame_root: Path,
                 error_map=error_map,
                 confidence_map=confidence_map,
                 valid_mask=valid_mask,
-                has_confidence=confidence_map is not None,
                 low_threshold=low_confidence_threshold,
                 medium_threshold=medium_confidence_threshold,
             )

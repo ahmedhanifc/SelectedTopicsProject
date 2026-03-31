@@ -10,6 +10,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 SAM2_DIR = REPO_ROOT / "src" / "sam2"
 EVAL_SCRIPT = SAM2_DIR / "eval_sasvi.py"
+PARALLEL_DISAGREEMENT_SCRIPT = REPO_ROOT / "parallelization_and_streaming" / "parallel_disagreement_sasvi.py"
+TIMED_ORIGINAL_SCRIPT = REPO_ROOT / "parallelization_and_streaming" / "time_original_disagreement_sasvi.py"
 
 
 PRESETS = {
@@ -55,6 +57,22 @@ PRESETS = {
         "save_disagreement_visuals": True,
         "max_disagreement_visuals": 6,
     },
+    "parallel_disagreement_090": {
+        "description": "Parallel disagreement pipeline with IoU threshold 0.90.",
+        "mode": "parallel-disagreement",
+        "dataset_type": "CHOLECSEG8K",
+        "enable_disagreement_gate": True,
+        "disagreement_iou_threshold": 0.90,
+        "disagreement_bad_frames": 2,
+    },
+    "original_timed_disagreement_090": {
+        "description": "Original disagreement pipeline with timing wrapper and IoU threshold 0.90.",
+        "mode": "original-timed-disagreement",
+        "dataset_type": "CHOLECSEG8K",
+        "enable_disagreement_gate": True,
+        "disagreement_iou_threshold": 0.90,
+        "disagreement_bad_frames": 2,
+    },
 }
 
 
@@ -90,6 +108,17 @@ def default_overseer_checkpoint(dataset_type: str) -> str | None:
     return str(checkpoint) if checkpoint is not None else None
 
 
+def default_sam2_checkpoint() -> str:
+    candidates = [
+        REPO_ROOT / "python" / "src" / "sam2" / "sam2" / "checkpoints" / "sam2.1_hiera_large.pt",
+        SAM2_DIR / "sam2" / "checkpoints" / "sam2.1_hiera_large.pt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    return str(candidates[0].resolve())
+
+
 def mode_defaults(mode: str) -> dict[str, object]:
     if mode == "baseline":
         return {
@@ -106,6 +135,16 @@ def mode_defaults(mode: str) -> dict[str, object]:
             "enable_disagreement_gate": True,
             "enable_boundary_distance_gate": True,
         }
+    if mode == "parallel-disagreement":
+        return {
+            "enable_disagreement_gate": True,
+            "enable_boundary_distance_gate": False,
+        }
+    if mode == "original-timed-disagreement":
+        return {
+            "enable_disagreement_gate": True,
+            "enable_boundary_distance_gate": False,
+        }
     raise ValueError(f"Unsupported mode: {mode}")
 
 
@@ -115,7 +154,7 @@ def base_defaults() -> dict[str, object]:
         "device": "cpu",
         "dataset_type": "CHOLECSEG8K",
         "sam2_cfg": "configs/sam2.1_hiera_l.yaml",
-        "sam2_checkpoint": str((SAM2_DIR / "sam2" / "checkpoints" / "sam2.1_hiera_large.pt").resolve()),
+        "sam2_checkpoint": default_sam2_checkpoint(),
         "overseer_type": "MaskRCNN",
         "overseer_checkpoint": None,
         "nnunet_checkpoint": None,
@@ -142,7 +181,18 @@ def base_defaults() -> dict[str, object]:
         "boundary_distance_threshold": 20.0,
         "save_disagreement_visuals": False,
         "max_disagreement_visuals": 10,
+        "output_root": None,
+        "analysis_output_root": None,
+        "save_overseer_masks": False,
+        "max_videos": None,
+        "overseer_batch_size": 8,
+        "save_queue_size": 32,
+        "disable_tqdm": False,
     }
+
+
+def is_parallel_mode(mode: str) -> bool:
+    return mode in {"parallel-disagreement", "original-timed-disagreement"}
 
 
 def build_run_name(config: dict[str, object], explicit_name: str | None) -> str:
@@ -198,12 +248,17 @@ def apply_cli_overrides(config: dict[str, object], args: argparse.Namespace) -> 
         "score_thresh": args.score_thresh,
         "overseer_mask_dir": resolve_repo_path(args.overseer_mask_dir) if args.overseer_mask_dir is not None else None,
         "nnunet_mask_dir": resolve_repo_path(args.nnunet_mask_dir) if args.nnunet_mask_dir is not None else None,
+        "output_root": resolve_repo_path(args.output_root) if args.output_root is not None else None,
+        "analysis_output_root": resolve_repo_path(args.analysis_output_root) if args.analysis_output_root is not None else None,
         "disagreement_iou_threshold": args.disagreement_threshold,
         "disagreement_foreground_iou_threshold": args.disagreement_fg_threshold,
         "disagreement_min_label_area": args.disagreement_min_label_area,
         "disagreement_bad_frames": args.bad_frames,
         "boundary_distance_threshold": args.boundary_threshold,
         "max_disagreement_visuals": args.max_visuals,
+        "max_videos": args.max_videos,
+        "overseer_batch_size": args.overseer_batch_size,
+        "save_queue_size": args.save_queue_size,
     }
     for key, value in scalar_overrides.items():
         if value is not None:
@@ -215,6 +270,8 @@ def apply_cli_overrides(config: dict[str, object], args: argparse.Namespace) -> 
         "enable_disagreement_gate": args.enable_disagreement_gate,
         "enable_boundary_distance_gate": args.enable_boundary_distance_gate,
         "save_disagreement_visuals": args.save_visuals,
+        "save_overseer_masks": args.save_overseer_masks,
+        "disable_tqdm": args.disable_tqdm,
     }
     for key, value in boolean_overrides.items():
         if value is not None:
@@ -251,10 +308,26 @@ def finalize_config(args: argparse.Namespace) -> dict[str, object]:
         )
 
     run_name = build_run_name(config, args.run_name)
-    if config.get("output_mask_dir") is None:
-        config["output_mask_dir"] = str((REPO_ROOT / f"output_masks_{run_name}").resolve())
-    if config.get("analysis_output_dir") is None:
-        config["analysis_output_dir"] = str((REPO_ROOT / f"analysis_output_{run_name}").resolve())
+    if is_parallel_mode(str(config["mode"])):
+        if config.get("output_root") is None:
+            default_output_root = (
+                f"parallel_disagreement_frame_outputs_{run_name}"
+                if config["mode"] == "parallel-disagreement"
+                else f"disagreement_frame_outputs_{run_name}"
+            )
+            config["output_root"] = str((REPO_ROOT / default_output_root).resolve())
+        if config.get("analysis_output_root") is None:
+            default_analysis_root = (
+                f"analysis_output_disagreement_parallel_{run_name}"
+                if config["mode"] == "parallel-disagreement"
+                else f"analysis_output_disagreement_original_{run_name}"
+            )
+            config["analysis_output_root"] = str((REPO_ROOT / default_analysis_root).resolve())
+    else:
+        if config.get("output_mask_dir") is None:
+            config["output_mask_dir"] = str((REPO_ROOT / f"output_masks_{run_name}").resolve())
+        if config.get("analysis_output_dir") is None:
+            config["analysis_output_dir"] = str((REPO_ROOT / f"analysis_output_{run_name}").resolve())
 
     return config
 
@@ -329,26 +402,112 @@ def build_eval_command(config: dict[str, object]) -> list[str]:
     return command
 
 
+def build_parallel_command(config: dict[str, object]) -> list[str]:
+    mode = str(config["mode"])
+    script_path = (
+        PARALLEL_DISAGREEMENT_SCRIPT
+        if mode == "parallel-disagreement"
+        else TIMED_ORIGINAL_SCRIPT
+    )
+    command = [
+        sys.executable,
+        str(script_path),
+        "--device",
+        str(config["device"]),
+        "--sam2_cfg",
+        str((SAM2_DIR / str(config["sam2_cfg"])).resolve()),
+        "--sam2_checkpoint",
+        str(config["sam2_checkpoint"]),
+        "--overseer_checkpoint",
+        str(config["overseer_checkpoint"]),
+        "--overseer_type",
+        str(config["overseer_type"]),
+        "--dataset_type",
+        str(config["dataset_type"]),
+        "--base_video_dir",
+        str(config["base_video_dir"]),
+        "--output_root",
+        str(config["output_root"]),
+        "--analysis_output_root",
+        str(config["analysis_output_root"]),
+        "--score_thresh",
+        str(config["score_thresh"]),
+        "--disagreement_iou_threshold",
+        str(config["disagreement_iou_threshold"]),
+        "--disagreement_bad_frames",
+        str(config["disagreement_bad_frames"]),
+        "--boundary_distance_threshold",
+        str(config["boundary_distance_threshold"]),
+        "--max_disagreement_visuals",
+        str(config["max_disagreement_visuals"]),
+    ]
+
+    optional_scalar_args = {
+        "--gt_root_dir": config.get("gt_root_dir"),
+        "--video_name": config.get("video_name"),
+        "--frame_name": config.get("frame_name"),
+        "--start_frame": config.get("start_frame"),
+        "--end_frame": config.get("end_frame"),
+        "--max_videos": config.get("max_videos"),
+    }
+    for flag, value in optional_scalar_args.items():
+        if value is not None:
+            command.extend([flag, str(value)])
+
+    if config.get("video_names") is not None:
+        command.append("--video_names")
+        command.extend(str(name) for name in config["video_names"])
+
+    optional_bool_flags = {
+        "--apply_postprocessing": config.get("apply_postprocessing"),
+        "--save_binary_mask": config.get("save_binary_mask"),
+        "--save_overseer_masks": config.get("save_overseer_masks"),
+        "--enable_disagreement_gate": config.get("enable_disagreement_gate"),
+        "--enable_boundary_distance_gate": config.get("enable_boundary_distance_gate"),
+        "--save_disagreement_visuals": config.get("save_disagreement_visuals"),
+    }
+    for flag, enabled in optional_bool_flags.items():
+        if enabled:
+            command.append(flag)
+
+    if mode == "parallel-disagreement":
+        command.extend([
+            "--overseer_batch_size",
+            str(config["overseer_batch_size"]),
+            "--save_queue_size",
+            str(config["save_queue_size"]),
+        ])
+        if config.get("disable_tqdm"):
+            command.append("--disable_tqdm")
+
+    return command
+
+
 def command_to_string(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
 def run_command(args: argparse.Namespace) -> int:
     config = finalize_config(args)
-    command = build_eval_command(config)
+    command = build_parallel_command(config) if is_parallel_mode(str(config["mode"])) else build_eval_command(config)
 
     print("Resolved run configuration:")
     print(f"  mode: {config['mode']}")
     print(f"  dataset: {config['dataset_type']}")
-    print(f"  output_mask_dir: {config['output_mask_dir']}")
-    print(f"  analysis_output_dir: {config['analysis_output_dir']}")
+    if is_parallel_mode(str(config["mode"])):
+        print(f"  output_root: {config['output_root']}")
+        print(f"  analysis_output_root: {config['analysis_output_root']}")
+    else:
+        print(f"  output_mask_dir: {config['output_mask_dir']}")
+        print(f"  analysis_output_dir: {config['analysis_output_dir']}")
     print("\nCommand:")
     print(command_to_string(command))
 
     if args.dry_run:
         return 0
 
-    completed = subprocess.run(command, cwd=SAM2_DIR)
+    run_cwd = REPO_ROOT if is_parallel_mode(str(config["mode"])) else SAM2_DIR
+    completed = subprocess.run(command, cwd=run_cwd)
     return completed.returncode
 
 
@@ -364,7 +523,7 @@ def add_run_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     parser.add_argument("--preset", choices=sorted(PRESETS), help="Optional preset to seed the run configuration.")
     parser.add_argument(
         "--mode",
-        choices=["baseline", "disagreement", "disagreement-boundary"],
+        choices=["baseline", "disagreement", "disagreement-boundary", "parallel-disagreement", "original-timed-disagreement"],
         help="High-level run mode. If omitted, uses the preset mode or baseline.",
     )
     parser.add_argument("--run-name", help="Optional name used to derive default output directories.")
@@ -386,6 +545,8 @@ def add_run_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     parser.add_argument("--base-video-dir", help="Root directory containing the video folders.")
     parser.add_argument("--output-mask-dir", help="Output directory for predicted masks.")
     parser.add_argument("--analysis-output-dir", help="Output directory for reports and metadata.")
+    parser.add_argument("--output-root", help="Root output directory used by the parallel and timed-original runners.")
+    parser.add_argument("--analysis-output-root", help="Root analysis directory used by the parallel and timed-original runners.")
     parser.add_argument("--gt-root-dir", help="Optional root directory containing ground-truth masks.")
     parser.add_argument("--video-name", help="Single video folder to run.")
     parser.add_argument("--video-names", nargs="+", help="Multiple video folders to run.")
@@ -436,6 +597,7 @@ def add_run_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentP
         help="Enable or disable boundary-distance gating.",
     )
     parser.add_argument("--boundary-threshold", type=float, help="Boundary-distance threshold in pixels.")
+    parser.add_argument("--max-videos", type=int, help="Optional cap on number of videos for parallel/timed-original runs.")
     parser.add_argument(
         "--save-visuals",
         action=argparse.BooleanOptionalAction,
@@ -443,6 +605,20 @@ def add_run_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentP
         help="Enable or disable disagreement visuals.",
     )
     parser.add_argument("--max-visuals", type=int, help="Maximum disagreement visuals per video.")
+    parser.add_argument(
+        "--save-overseer-masks",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable Overseer mask export for parallel/timed-original runs.",
+    )
+    parser.add_argument("--overseer-batch-size", type=int, help="Parallel Overseer precomputation batch size.")
+    parser.add_argument("--save-queue-size", type=int, help="Parallel save queue size.")
+    parser.add_argument(
+        "--disable-tqdm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable tqdm progress bars for the parallel runner.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the resolved command without executing it.")
     parser.set_defaults(func=run_command)
 

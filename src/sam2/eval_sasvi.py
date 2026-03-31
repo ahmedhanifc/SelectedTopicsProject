@@ -107,7 +107,7 @@ from analysis_tools.inference_export import (
     write_rows_to_csv,
     write_markdown_report,
 )
-from analysis_tools.config import get_dataset_config
+from analysis_tools.config import get_dataset_config, get_distinct_visual_palette
 from analysis_tools.error_analysis import compute_frame_metrics, load_dataset_mask
 
 
@@ -479,34 +479,7 @@ def save_disagreement_visual(path, frame_path, sam_foreground, overseer_foregrou
 
 
 def get_primary_visual_palette(num_classes):
-    base_colors = np.array([
-        [127, 127, 127],  # background
-        [255, 0, 0],      # red
-        [0, 0, 255],      # blue
-        [0, 200, 0],      # green
-        [255, 255, 0],    # yellow
-        [255, 0, 255],    # magenta
-        [0, 255, 255],    # cyan
-        [255, 128, 0],    # orange
-        [128, 0, 255],    # violet
-        [139, 69, 19],    # brown
-        [255, 255, 255],  # white
-        [0, 0, 0],        # black
-        [0, 128, 128],    # teal
-        [128, 128, 0],    # olive
-        [128, 0, 0],      # maroon
-        [0, 128, 0],      # dark green
-        [0, 128, 255],    # azure
-        [255, 0, 128],    # rose
-        [64, 64, 255],    # strong periwinkle
-        [0, 180, 120],    # sea green
-    ], dtype=np.uint8)
-    if num_classes <= len(base_colors):
-        return base_colors[:num_classes]
-    extra = []
-    for idx in range(len(base_colors), num_classes):
-        extra.append([(53 * idx) % 256, (97 * idx) % 256, (193 * idx) % 256])
-    return np.vstack([base_colors, np.array(extra, dtype=np.uint8)])
+    return get_distinct_visual_palette(num_classes=num_classes, background_index=0)
 
 
 def smooth_label_map(label_map, fill_value):
@@ -1742,8 +1715,8 @@ def main():
     else:        
         raise NotImplementedError
 
-    palette = get_primary_visual_palette(num_classes)
     gt_dataset_config = get_dataset_config(args.dataset_type)
+    palette = gt_dataset_config.palette
 
     if args.overseer_type == "MaskRCNN":
         maskrcnn_model = get_model_instance_segmentation(
