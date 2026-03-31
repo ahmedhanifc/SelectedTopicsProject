@@ -2,7 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Controls, { type DisplayMode } from "@/components/Controls";
-import VideoPanel from "@/components/VideoPanel";
+import FocusZone, { type FocusPoint } from "@/components/FocusZone";
+import VideoPanel, { type FocusSource } from "@/components/VideoPanel";
 import VitalsPanel from "@/components/VitalsPanel";
 
 type FramePayload = {
@@ -14,17 +15,20 @@ type FramePayload = {
 
 export default function DashboardPage() {
   const [mode, setMode] = useState<DisplayMode>("RAW");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [payload, setPayload] = useState<FramePayload | null>(null);
   const [frameIndex, setFrameIndex] = useState(0);
   const [playing, setPlaying] = useState(true);
   const [confidenceOverlayEnabled, setConfidenceOverlayEnabled] = useState(true);
   const [pipelineStatus, setPipelineStatus] = useState("Live session");
+  const [focusPoint, setFocusPoint] = useState<FocusPoint>({ x: 0.5, y: 0.5 });
+  const [focusSource, setFocusSource] = useState<FocusSource>("raw");
 
   useEffect(() => {
     let cancelled = false;
 
     async function loadFrames() {
-      const response = await fetch("/api/frames?video=video01&clip=video01_00160");
+      const response = await fetch("/api/frames?video=video01");
       if (!response.ok) {
         throw new Error("Failed to load frame sequence");
       }
@@ -69,100 +73,120 @@ export default function DashboardPage() {
     };
   }, [frameIndex, payload]);
 
+  const focusSrc = focusSource === "mask" ? currentFrame?.mask ?? null : currentFrame?.raw ?? null;
+
   return (
     <main className="clinical-shell">
-      <section className="monitor-frame">
-        <header className="monitor-header">
-          <div>
-            <h1>John Doe: Cholecystectomy</h1>
+      <section className={sidebarCollapsed ? "monitor-frame sidebar-collapsed" : "monitor-frame"}>
+        <aside className={sidebarCollapsed ? "sidebar-shell collapsed" : "sidebar-shell"}>
+          <div className="sidebar-topbar">
+            {sidebarCollapsed ? (
+              <button
+                type="button"
+                className="sidebar-toggle"
+                onClick={() => setSidebarCollapsed(false)}
+                aria-label="Expand sidebar"
+              >
+                +
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="sidebar-toggle close"
+                onClick={() => setSidebarCollapsed(true)}
+                aria-label="Collapse sidebar"
+              >
+                {"\u00D7"}
+              </button>
+            )}
           </div>
-          <div className="session-meta">
-            <span>Operating room 4</span>
-            <strong>
-              {pipelineStatus}
-              <i />
-            </strong>
-          </div>
-        </header>
 
-        <VideoPanel
-          mode={mode}
-          rawSrc={currentFrame?.raw ?? null}
-          maskSrc={currentFrame?.mask ?? null}
-          confidenceOverlayEnabled={confidenceOverlayEnabled}
-        />
+          <section className="sidebar-card">
+            {!sidebarCollapsed ? <span className="sidebar-card-title">Modes</span> : null}
+            <Controls
+              mode={mode}
+              onModeChange={setMode}
+              playing={playing}
+              onTogglePlaying={() => setPlaying((value) => !value)}
+              confidenceOverlayEnabled={confidenceOverlayEnabled}
+              onToggleConfidenceOverlay={() => setConfidenceOverlayEnabled((value) => !value)}
+              collapsed={sidebarCollapsed}
+              showActions={false}
+            />
+          </section>
 
-        <section className="info-grid">
-          <VitalsPanel />
+          <section className="sidebar-actions-block">
+            <Controls
+              mode={mode}
+              onModeChange={setMode}
+              playing={playing}
+              onTogglePlaying={() => setPlaying((value) => !value)}
+              confidenceOverlayEnabled={confidenceOverlayEnabled}
+              onToggleConfidenceOverlay={() => setConfidenceOverlayEnabled((value) => !value)}
+              collapsed={sidebarCollapsed}
+              showModes={false}
+            />
+          </section>
+        </aside>
 
-          <article className="info-card">
-            <span className="mini-heading">AI focus zone</span>
-            <div className="focus-card">
-              {currentFrame?.raw ? <img src={currentFrame.raw} alt="AI focus region" /> : null}
-              <div className="focus-caption">
-                <span>Micro-focus crop</span>
-                <strong>2.5x zoom</strong>
-              </div>
+        <section className="content-shell">
+          <header className="monitor-header">
+            <div>
+              <h1>John Doe: Cholecystectomy</h1>
             </div>
-          </article>
-
-          <article className="info-card">
-            <span className="mini-heading">Robotic telemetry</span>
-            <div className="telemetry-list">
-              <div className="telemetry-row">
-                <label>Arm α force</label>
-                <div className="meter-track">
-                  <span style={{ width: "56%" }} />
-                </div>
-                <strong>1.2N</strong>
-              </div>
-              <div className="telemetry-row">
-                <label>Arm β force</label>
-                <div className="meter-track">
-                  <span style={{ width: "34%" }} />
-                </div>
-                <strong>0.8N</strong>
-              </div>
-              <div className="telemetry-row">
-                <label>Latency</label>
-                <div className="meter-track quiet">
-                  <span style={{ width: "12%" }} />
-                </div>
-                <strong>12ms</strong>
-              </div>
+            <div className="session-meta">
+              <span>Operating room 4</span>
+              <strong>
+                {pipelineStatus}
+                <i />
+              </strong>
             </div>
-          </article>
+          </header>
 
-          <article className="info-card">
-            <span className="mini-heading">Confidence legend</span>
-            <ul className="legend-list">
-              <li>
-                <i className="legend-dot high" />
-                <span>High</span>
-                <strong>95-100%</strong>
-              </li>
-              <li>
-                <i className="legend-dot medium" />
-                <span>Medium</span>
-                <strong>70-94%</strong>
-              </li>
-              <li>
-                <i className="legend-dot low" />
-                <span>Low</span>
-                <strong>&lt; 70%</strong>
-              </li>
-            </ul>
-          </article>
+          <VideoPanel
+            mode={mode}
+            rawSrc={currentFrame?.raw ?? null}
+            maskSrc={currentFrame?.mask ?? null}
+            confidenceOverlayEnabled={confidenceOverlayEnabled}
+            focusPoint={focusPoint}
+            onFocusChange={(source, point) => {
+              setFocusSource(source);
+              setFocusPoint(point);
+            }}
+          />
+
+          <section className="info-grid">
+            <VitalsPanel />
+
+            <article className="info-card">
+              <span className="mini-heading">AI focus zone</span>
+              <div className="focus-card">
+                <FocusZone src={focusSrc} point={focusPoint} onFocusChange={setFocusPoint} />
+              </div>
+            </article>
+
+            <article className="info-card">
+              <span className="mini-heading">Confidence legend</span>
+              <ul className="legend-list">
+                <li>
+                  <i className="legend-dot high" />
+                  <span>High</span>
+                  <strong>95-100%</strong>
+                </li>
+                <li>
+                  <i className="legend-dot medium" />
+                  <span>Medium</span>
+                  <strong>70-94%</strong>
+                </li>
+                <li>
+                  <i className="legend-dot low" />
+                  <span>Low</span>
+                  <strong>&lt; 70%</strong>
+                </li>
+              </ul>
+            </article>
+          </section>
         </section>
-
-        <Controls
-          mode={mode}
-          onModeChange={setMode}
-          playing={playing}
-          onTogglePlaying={() => setPlaying((value) => !value)}
-          confidenceOverlayEnabled={confidenceOverlayEnabled}
-          onToggleConfidenceOverlay={() => setConfidenceOverlayEnabled((value) => !value)}
-        />
       </section>
     </main>
   );

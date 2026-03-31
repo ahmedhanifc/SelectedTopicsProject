@@ -7,7 +7,7 @@ export const runtime = "nodejs";
 export async function POST(request: Request) {
   try {
     const body = (await request.json().catch(() => ({}))) as { input?: string };
-    const input = body.input ?? "public/data/video01/video01_00160";
+    const input = body.input ?? "public/data/video01";
     const absoluteInput = path.isAbsolute(input) ? input : path.join(process.cwd(), input);
     const result = await runPythonPipeline(absoluteInput);
     return NextResponse.json(result);

@@ -27,7 +27,7 @@ def list_images(folder: Path, suffix_filter: str | None = None) -> list[Path]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Simple Python bridge for the Next.js prototype.")
-    parser.add_argument("--input", required=True, help="Clip directory containing frames/ and masks/ subfolders.")
+    parser.add_argument("--input", required=True, help="Video directory containing frames/ and masks/ subfolders.")
     args = parser.parse_args()
 
     clip_dir = Path(args.input).resolve()

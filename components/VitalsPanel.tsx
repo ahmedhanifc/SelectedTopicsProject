@@ -18,7 +18,13 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
-export default function VitalsPanel() {
+export default function VitalsPanel({
+  className = "",
+  showTitle = true
+}: {
+  className?: string;
+  showTitle?: boolean;
+}) {
   const [vitals, setVitals] = useState<VitalsState>(INITIALS);
 
   useEffect(() => {
@@ -37,8 +43,8 @@ export default function VitalsPanel() {
   }, []);
 
   return (
-    <article className="info-card vitals-card">
-      <span className="mini-heading">Patient vitals</span>
+    <article className={className ? className : "info-card vitals-card"}>
+      {showTitle ? <span className="mini-heading">Patient vitals</span> : null}
       <div className="vitals-stack">
         <div className="vital-line">
           <label>Heart rate</label>

@@ -6,7 +6,7 @@ export const runtime = "nodejs";
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const video = searchParams.get("video") ?? "video01";
-  const clip = searchParams.get("clip") ?? "video01_00160";
+  const clip = searchParams.get("clip") ?? "video01";
 
   try {
     const payload = await getFrameSequence({ video, clip });
