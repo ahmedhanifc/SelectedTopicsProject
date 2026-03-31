@@ -936,10 +936,17 @@ def sasvi_inference(
     break_endless_loop = False
     inference_rows = {}
     confidence_dir = None
+    raw_confidence_dir = None
+    smoothed_confidence_dir = None
     disagreement_visual_dir = None
     if analysis_output_dir is not None:
-        confidence_dir = os.path.join(analysis_output_dir, "inference", "confidence_maps", video_name)
+        confidence_root_dir = os.path.join(analysis_output_dir, "inference", "confidence_maps")
+        confidence_dir = os.path.join(confidence_root_dir, video_name)  # legacy raw path
+        raw_confidence_dir = os.path.join(confidence_root_dir, "raw", video_name)
+        smoothed_confidence_dir = os.path.join(confidence_root_dir, "smoothed", video_name)
         os.makedirs(confidence_dir, exist_ok=True)
+        os.makedirs(raw_confidence_dir, exist_ok=True)
+        os.makedirs(smoothed_confidence_dir, exist_ok=True)
         if save_disagreement_visuals:
             disagreement_visual_dir = os.path.join(
                 analysis_output_dir, "inference", "disagreement_visuals", video_name
@@ -1112,6 +1119,12 @@ def sasvi_inference(
                     width=width,
                     disagreement_min_label_area=disagreement_min_label_area,
                 )
+                pred_label_map = per_obj_mask_to_label_map(
+                    per_obj_mask=per_obj_output_mask,
+                    height=height,
+                    width=width,
+                    shift_by_1=shift_by_1,
+                )
                 boundary_distance = None
                 if enable_boundary_distance_gate:
                     boundary_distance = compute_boundary_distance(
@@ -1120,16 +1133,37 @@ def sasvi_inference(
                     )
 
                 if confidence_dir is not None and len(out_obj_ids) > 0:
+                    fill_value = 255 if shift_by_1 else 0
+                    smoothed_pred_label_map = smooth_label_map(pred_label_map, fill_value=fill_value)
                     confidence_map = compute_confidence_map(
                         out_mask_logits,
                         object_ids=out_obj_ids,
                         score_thresh=score_thresh,
+                        final_label_map=pred_label_map,
+                        background_label=fill_value,
+                    )
+                    smoothed_confidence_map = compute_confidence_map(
+                        out_mask_logits,
+                        object_ids=out_obj_ids,
+                        score_thresh=score_thresh,
+                        final_label_map=smoothed_pred_label_map,
+                        background_label=fill_value,
                     )
                     confidence_path = os.path.join(
                         confidence_dir,
                         f"{frame_names[out_frame_idx]}_confidence.png",
                     )
+                    raw_confidence_path = os.path.join(
+                        raw_confidence_dir,
+                        f"{frame_names[out_frame_idx]}_confidence.png",
+                    )
+                    smoothed_confidence_path = os.path.join(
+                        smoothed_confidence_dir,
+                        f"{frame_names[out_frame_idx]}_confidence.png",
+                    )
                     save_confidence_map(confidence_path, confidence_map)
+                    save_confidence_map(raw_confidence_path, confidence_map)
+                    save_confidence_map(smoothed_confidence_path, smoothed_confidence_map)
                     confidence_stats = summarise_confidence_map(confidence_map)
                     inference_rows[frame_names[out_frame_idx]] = {
                         "video_name": video_name,
@@ -1196,12 +1230,6 @@ def sasvi_inference(
                     "gt_error_rate": None,
                 }
                 if gt_mask_path is not None:
-                    pred_label_map = per_obj_mask_to_label_map(
-                        per_obj_mask=per_obj_output_mask,
-                        height=height,
-                        width=width,
-                        shift_by_1=shift_by_1,
-                    )
                     gt_label_map = load_dataset_mask(gt_mask_path, gt_dataset_config)
                     gt_frame_metrics = compute_frame_metrics(
                         pred_mask=pred_label_map,

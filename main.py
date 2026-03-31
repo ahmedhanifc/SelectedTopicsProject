@@ -723,8 +723,8 @@ def add_error_analysis_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser.add_argument("--image-suffix", default=".jpg", help="Filename suffix for input frames.")
     parser.add_argument("--ignore-index", type=int, help="Optional ignore index override.")
     parser.add_argument("--background-index", type=int, help="Optional background index override.")
-    parser.add_argument("--confidence-low-threshold", type=float, default=0.35, help="Low-confidence threshold.")
-    parser.add_argument("--confidence-medium-threshold", type=float, default=0.60, help="Medium-confidence threshold.")
+    parser.add_argument("--confidence-low-threshold", type=float, default=0.50, help="Low-confidence threshold.")
+    parser.add_argument("--confidence-medium-threshold", type=float, default=0.80, help="Medium-confidence threshold.")
     parser.add_argument("--dry-run", action="store_true", help="Print the resolved command without executing it.")
     parser.set_defaults(func=run_error_analysis_command)
 

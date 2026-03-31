@@ -2,6 +2,8 @@ data/
 dataset/
 frame_root/
 gt_root/
+videos/
+public/
 output_masks/
 output_masks_*/
 analysis_output/
@@ -14,6 +16,8 @@ google_drive_upload/
 src/sam2/eval_sasvi_live_maskrcnn_nnunet.py
 src/sam2/eval_sasvi_old.py
 .DS_Store
+node_modules/
+.next/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -237,5 +241,4 @@ push/
 # # !push/**/analysis_output/report_raw/*.csv
 # # !push/**/analysis_output/report_raw/*.md
 # # !push/**/analysis_output/report_raw/*.json
-
 

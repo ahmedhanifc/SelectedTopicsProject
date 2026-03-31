@@ -293,6 +293,28 @@ def _summarize_foreground_confidence(
     }
 
 
+def _resolve_confidence_path(
+    confidence_root: Path | None,
+    pred_root: Path,
+    video_name: str,
+    frame_name: str,
+) -> Path | None:
+    if confidence_root is None:
+        return None
+
+    candidate_paths: list[Path] = []
+    variant_name = pred_root.name.lower()
+    if variant_name in {"raw", "smoothed"}:
+        candidate_paths.append(confidence_root / variant_name / video_name / f"{frame_name}_confidence.png")
+
+    candidate_paths.append(confidence_root / video_name / f"{frame_name}_confidence.png")
+
+    for candidate_path in candidate_paths:
+        if candidate_path.exists():
+            return candidate_path
+    return None
+
+
 def _resize_to_match(mask: np.ndarray, size_hw: tuple[int, int]) -> np.ndarray:
     height, width = size_hw
     if mask.shape[:2] == (height, width):
@@ -375,11 +397,33 @@ def _make_pattern_mask(shape_hw: tuple[int, int], spacing: int, pattern_name: st
         return ((xx + yy) % spacing) < line_width
 
     if pattern_name == "polka_dots":
-        center = spacing // 2
+        tile = max(spacing, (POLKA_DOT_RADIUS * 4) + 4)
+        tile_x = xx // tile
+        tile_y = yy // tile
+        local_x = xx % tile
+        local_y = yy % tile
+
+        # Deterministic per-tile jitter so dots feel scattered instead of rigidly aligned.
+        seed = (tile_x * 97 + tile_y * 193 + 29) % 997
+        max_offset = max(1, tile - (POLKA_DOT_RADIUS * 2) - 2)
+        offset_x = seed % max_offset
+        offset_y = (seed * 11) % max_offset
+
+        # Break up any remaining row/column alignment by adding asymmetric row and
+        # column shifts that vary per tile, while keeping placement deterministic.
+        offset_x = (offset_x + ((tile_y % 4) * max(1, tile // 4))) % max_offset
+        offset_y = (offset_y + ((tile_x % 3) * max(1, tile // 5))) % max_offset
+
         radius = min(POLKA_DOT_RADIUS, max(1, spacing // 3))
-        dot_x = (xx % spacing) - center
-        dot_y = (yy % spacing) - center
-        return (dot_x * dot_x + dot_y * dot_y) <= (radius * radius)
+        center_x = 1 + offset_x + radius
+        center_y = 1 + offset_y + radius
+        dot_x = local_x - center_x
+        dot_y = local_y - center_y
+        dot_mask = (dot_x * dot_x + dot_y * dot_y) <= (radius * radius)
+
+        # Deterministically drop some tiles so the field feels less uniform.
+        active_tile = ((tile_x * 5 + tile_y * 7 + 3) % 6) != 0
+        return np.logical_and(dot_mask, active_tile)
 
     if pattern_name == "triangles":
         tile = max(TRIANGLE_TILE_SIZE, spacing * 2)
@@ -445,21 +489,21 @@ def _apply_confidence_band_patterns(
         region_mask=high_confidence_mask,
         color=pattern_color,
         spacing=HIGH_CONFIDENCE_SPACING,
-        pattern_name="stripes",
+        pattern_name="polka_dots",
     )
     patterned = _apply_pattern_overlay(
         patterned,
         region_mask=medium_confidence_mask,
         color=pattern_color,
         spacing=MEDIUM_CONFIDENCE_SPACING,
-        pattern_name="polka_dots",
+        pattern_name="triangles",
     )
     patterned = _apply_pattern_overlay(
         patterned,
         region_mask=low_confidence_mask,
         color=pattern_color,
         spacing=LOW_CONFIDENCE_SPACING,
-        pattern_name="triangles",
+        pattern_name="stripes",
     )
     return patterned
 
@@ -1078,7 +1122,12 @@ def analyze_predictions(frame_root: Path,
             confidence_path = None
             confidence_map = None
             if confidence_root is not None:
-                confidence_path = confidence_root / video_name / f"{frame_name}_confidence.png"
+                confidence_path = _resolve_confidence_path(
+                    confidence_root=confidence_root,
+                    pred_root=pred_root,
+                    video_name=video_name,
+                    frame_name=frame_name,
+                )
                 confidence_map = _load_confidence_map(confidence_path)
                 if confidence_map is not None:
                     confidence_map = _resize_to_match((confidence_map * 255).astype(np.uint8), gt_mask.shape[:2]).astype(np.float32) / 255.0

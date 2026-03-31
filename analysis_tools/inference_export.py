@@ -40,7 +40,9 @@ INFERENCE_METADATA_COLUMNS = [
 
 def compute_confidence_map(mask_logits: torch.Tensor,
                            object_ids: list[int] | torch.Tensor,
-                           score_thresh: float) -> np.ndarray:
+                           score_thresh: float,
+                           final_label_map: np.ndarray | None = None,
+                           background_label: int = 0) -> np.ndarray:
     logits = mask_logits.detach().float().cpu()
     if logits.ndim == 4 and logits.shape[1] == 1:
         logits = logits.squeeze(1)
@@ -62,15 +64,30 @@ def compute_confidence_map(mask_logits: torch.Tensor,
 
     logits_np = logits.numpy().astype(np.float32)
     probs_np = probs.numpy().astype(np.float32)
-    confidence = 1.0 - probs_np.max(axis=0)
     thresholded_masks = logits_np > float(score_thresh)
     object_index = {object_id: index for index, object_id in enumerate(object_ids)}
 
-    # Mirror put_per_obj_mask(): lower label ids win on overlap because the combined
-    # label map is written in descending label order and later writes overwrite earlier ones.
-    for object_id in sorted(object_ids, reverse=True):
-        mask = thresholded_masks[object_index[object_id]]
-        confidence[mask] = probs_np[object_index[object_id]][mask]
+    if final_label_map is None:
+        final_label_map = np.full(thresholded_masks.shape[1:], fill_value=background_label, dtype=np.int32)
+        # Mirror put_per_obj_mask(): lower label ids win on overlap because the combined
+        # label map is written in descending label order and later writes overwrite earlier ones.
+        for object_id in sorted(object_ids, reverse=True):
+            object_mask = thresholded_masks[object_index[object_id]]
+            final_label_map[object_mask] = object_id
+    else:
+        final_label_map = np.asarray(final_label_map, dtype=np.int32)
+        if final_label_map.shape != thresholded_masks.shape[1:]:
+            raise ValueError(
+                "final_label_map must match the spatial shape of mask_logits, "
+                f"got {final_label_map.shape} and {thresholded_masks.shape[1:]}"
+            )
+
+    confidence = np.zeros(final_label_map.shape, dtype=np.float32)
+    for object_id in object_ids:
+        object_mask = final_label_map == object_id
+        if not object_mask.any():
+            continue
+        confidence[object_mask] = probs_np[object_index[object_id]][object_mask]
 
     return np.clip(confidence, 0.0, 1.0).astype(np.float32)
 

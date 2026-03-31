@@ -25,8 +25,8 @@ def main() -> None:
     parser.add_argument("--image_suffix", type=str, default=".jpg", help="Filename suffix for input frames.")
     parser.add_argument("--ignore_index", type=int, default=None, help="Optional override for dataset ignore index.")
     parser.add_argument("--background_index", type=int, default=None, help="Optional override for dataset background index.")
-    parser.add_argument("--confidence_low_threshold", type=float, default=0.35, help="Low-confidence threshold used for overlay patterning.")
-    parser.add_argument("--confidence_medium_threshold", type=float, default=0.60, help="Medium-confidence threshold used for overlay patterning.")
+    parser.add_argument("--confidence_low_threshold", type=float, default=0.50, help="Low-confidence threshold used for overlay patterning.")
+    parser.add_argument("--confidence_medium_threshold", type=float, default=0.80, help="Medium-confidence threshold used for overlay patterning.")
     args = parser.parse_args()
 
     if not 0.0 <= args.confidence_low_threshold <= 1.0:

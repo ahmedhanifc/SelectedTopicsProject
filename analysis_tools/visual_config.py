@@ -9,8 +9,8 @@ python analysis_tools/run_error_analysis.py \
   --output_root ./analysis_output/report \
   --dataset_type CHOLECSEG8K \
   --confidence_root ./analysis_output/inference/confidence_maps \
-  --confidence_low_threshold 0.35 \
-  --confidence_medium_threshold 0.60
+  --confidence_low_threshold 0.50 \
+  --confidence_medium_threshold 0.80
 
 Most useful knobs:
 - BACKGROUND_DIM_FACTOR:
@@ -33,11 +33,11 @@ ERROR_OVERLAY_ALPHA = 0.75
 
 # Confidence pattern settings.
 LOW_CONFIDENCE_SPACING = 10
-MEDIUM_CONFIDENCE_SPACING = 14
-HIGH_CONFIDENCE_SPACING = 19
+MEDIUM_CONFIDENCE_SPACING = 5
+HIGH_CONFIDENCE_SPACING = 40
 PATTERN_LINE_WIDTH_MIN = 1
-PATTERN_LINE_WIDTH_DIVISOR = 4
-POLKA_DOT_RADIUS = 2
+PATTERN_LINE_WIDTH_DIVISOR = 10
+POLKA_DOT_RADIUS = 5
 TRIANGLE_SIDE = 8
 TRIANGLE_TILE_SIZE = 30
 
