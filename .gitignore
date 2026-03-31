@@ -204,11 +204,13 @@ JIJI_README.md
 
 archive/
 old_tests/
+reports/
 normalize_cholecseg8k_prediction_masks.py
 RESULTS_run_20260325_comparison.md
 SYSTEM_CONFIGURATION_AND_IMPLEMENTATION.md
 stream_disagreement_outputs/
 collect_sample_frames.py
+tsconfig.tsbuildinfo
 
 # keep push/ visible, but ignore heavy generated contents there by default
 
