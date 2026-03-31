@@ -114,6 +114,72 @@ def default_sam2_checkpoint() -> str:
     return str(checkpoint_path.resolve())
 
 
+def discover_video_names(base_video_dir: str) -> list[str]:
+    root = Path(base_video_dir)
+    if not root.exists():
+        return []
+
+    discovered: list[str] = []
+    for entry in sorted(root.iterdir(), key=lambda path: path.name):
+        if not entry.is_dir():
+            continue
+        if any(child.is_file() for child in entry.iterdir()):
+            discovered.append(entry.name)
+            continue
+        for child in sorted(entry.iterdir(), key=lambda path: path.name):
+            if child.is_dir() and any(grandchild.is_file() for grandchild in child.iterdir()):
+                discovered.append(child.name)
+    return discovered
+
+
+def _matching_video_names(requested_name: str, discovered_names: list[str]) -> list[str]:
+    if requested_name in discovered_names:
+        return [requested_name]
+    prefix = f"{requested_name}_"
+    return [name for name in discovered_names if name.startswith(prefix)]
+
+
+def expand_video_selection(config: dict[str, object]) -> None:
+    discovered_names = discover_video_names(str(config["base_video_dir"]))
+    if not discovered_names:
+        return
+
+    video_name = config.get("video_name")
+    if video_name is not None:
+        requested_name = str(video_name)
+        matches = _matching_video_names(requested_name, discovered_names)
+        if not matches:
+            raise ValueError(
+                f"Requested video selection '{video_name}' did not match any videos under {config['base_video_dir']}."
+            )
+        if requested_name not in discovered_names:
+            config["video_name"] = None
+            config["video_names"] = matches
+        return
+
+    video_names = config.get("video_names")
+    if video_names is None:
+        return
+
+    expanded_names: list[str] = []
+    missing_names: list[str] = []
+    for requested_name in video_names:
+        matches = _matching_video_names(str(requested_name), discovered_names)
+        if not matches:
+            missing_names.append(str(requested_name))
+            continue
+        for match in matches:
+            if match not in expanded_names:
+                expanded_names.append(match)
+
+    if missing_names:
+        raise ValueError(
+            f"Requested video selection(s) not found under {config['base_video_dir']}: {missing_names}"
+        )
+
+    config["video_names"] = expanded_names
+
+
 def mode_defaults(mode: str) -> dict[str, object]:
     if mode == "baseline":
         return {
@@ -303,6 +369,7 @@ def finalize_config(args: argparse.Namespace) -> dict[str, object]:
         )
 
     run_name = build_run_name(config, args.run_name)
+    expand_video_selection(config)
     if is_parallel_mode(str(config["mode"])):
         if config.get("output_root") is None:
             default_output_root = (
