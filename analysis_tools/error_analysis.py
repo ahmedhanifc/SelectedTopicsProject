@@ -50,6 +50,17 @@ REPORT_COLUMNS = [
     "confidence_std",
     "confidence_min",
     "confidence_max",
+    "foreground_confidence_mean",
+    "foreground_confidence_std",
+    "foreground_confidence_min",
+    "foreground_confidence_max",
+    "foreground_pixels",
+    "low_confidence_pixels",
+    "medium_confidence_pixels",
+    "high_confidence_pixels",
+    "low_confidence_ratio",
+    "medium_confidence_ratio",
+    "high_confidence_ratio",
     "pred_classes",
     "gt_classes",
     "per_class_iou",
@@ -66,6 +77,14 @@ PER_VIDEO_SUMMARY_COLUMNS = [
     "false_positive_pixels",
     "false_negative_pixels",
     "class_confusion_pixels",
+    "confidence_frames",
+    "foreground_confidence_mean",
+    "foreground_confidence_std",
+    "foreground_confidence_min",
+    "foreground_confidence_max",
+    "low_confidence_ratio",
+    "medium_confidence_ratio",
+    "high_confidence_ratio",
 ]
 
 PER_CLASS_SUMMARY_COLUMNS = [
@@ -85,6 +104,10 @@ WORST_FRAMES_COLUMNS = [
     "false_positive_pixels",
     "false_negative_pixels",
     "class_confusion_pixels",
+    "foreground_confidence_mean",
+    "low_confidence_ratio",
+    "medium_confidence_ratio",
+    "high_confidence_ratio",
     "artifact_dir",
 ]
 
@@ -211,6 +234,63 @@ def _load_confidence_map(path: Path | None) -> np.ndarray | None:
     with Image.open(path) as image:
         confidence = np.array(image.convert("L"), dtype=np.float32) / 255.0
     return confidence
+
+
+def _summarize_foreground_confidence(
+    confidence_map: np.ndarray | None,
+    pred_mask: np.ndarray,
+    valid_mask: np.ndarray,
+    background_index: int | None,
+    ignore_index: int | None,
+    low_threshold: float,
+    medium_threshold: float,
+) -> dict[str, float | int | str]:
+    empty_stats: dict[str, float | int | str] = {
+        "foreground_confidence_mean": "",
+        "foreground_confidence_std": "",
+        "foreground_confidence_min": "",
+        "foreground_confidence_max": "",
+        "foreground_pixels": 0,
+        "low_confidence_pixels": 0,
+        "medium_confidence_pixels": 0,
+        "high_confidence_pixels": 0,
+        "low_confidence_ratio": "",
+        "medium_confidence_ratio": "",
+        "high_confidence_ratio": "",
+    }
+    if confidence_map is None:
+        return empty_stats
+
+    foreground_mask = valid_mask.copy()
+    if background_index is not None:
+        foreground_mask &= pred_mask != background_index
+    if ignore_index is not None:
+        foreground_mask &= pred_mask != ignore_index
+
+    foreground_pixels = int(foreground_mask.sum())
+    if foreground_pixels == 0:
+        return empty_stats
+
+    foreground_confidence = np.clip(confidence_map[foreground_mask], 0.0, 1.0)
+    low_confidence_pixels = int((foreground_confidence <= low_threshold).sum())
+    medium_confidence_pixels = int(
+        np.logical_and(foreground_confidence > low_threshold, foreground_confidence <= medium_threshold).sum()
+    )
+    high_confidence_pixels = int((foreground_confidence > medium_threshold).sum())
+
+    return {
+        "foreground_confidence_mean": float(foreground_confidence.mean()),
+        "foreground_confidence_std": float(foreground_confidence.std()),
+        "foreground_confidence_min": float(foreground_confidence.min()),
+        "foreground_confidence_max": float(foreground_confidence.max()),
+        "foreground_pixels": foreground_pixels,
+        "low_confidence_pixels": low_confidence_pixels,
+        "medium_confidence_pixels": medium_confidence_pixels,
+        "high_confidence_pixels": high_confidence_pixels,
+        "low_confidence_ratio": float(low_confidence_pixels / foreground_pixels),
+        "medium_confidence_ratio": float(medium_confidence_pixels / foreground_pixels),
+        "high_confidence_ratio": float(high_confidence_pixels / foreground_pixels),
+    }
 
 
 def _resize_to_match(mask: np.ndarray, size_hw: tuple[int, int]) -> np.ndarray:
@@ -672,6 +752,7 @@ def _aggregate_video_rows(report_rows: list[dict[str, Any]], logical_name_map: d
     aggregated_rows: list[dict[str, Any]] = []
     for logical_name in sorted(grouped_rows):
         rows = grouped_rows[logical_name]
+        confidence_rows = [row for row in rows if row.get("foreground_confidence_mean") not in ("", None)]
         aggregated_rows.append({
             "video_name": logical_name,
             "frames_evaluated": len(rows),
@@ -682,11 +763,20 @@ def _aggregate_video_rows(report_rows: list[dict[str, Any]], logical_name_map: d
             "false_positive_pixels": int(sum(int(row["false_positive_pixels"]) for row in rows)),
             "false_negative_pixels": int(sum(int(row["false_negative_pixels"]) for row in rows)),
             "class_confusion_pixels": int(sum(int(row["class_confusion_pixels"]) for row in rows)),
+            "confidence_frames": len(confidence_rows),
+            "foreground_confidence_mean": _mean_or_zero([float(row["foreground_confidence_mean"]) for row in confidence_rows]) if confidence_rows else None,
+            "foreground_confidence_std": _mean_or_zero([float(row["foreground_confidence_std"]) for row in confidence_rows]) if confidence_rows else None,
+            "foreground_confidence_min": min(float(row["foreground_confidence_min"]) for row in confidence_rows) if confidence_rows else None,
+            "foreground_confidence_max": max(float(row["foreground_confidence_max"]) for row in confidence_rows) if confidence_rows else None,
+            "low_confidence_ratio": _mean_or_zero([float(row["low_confidence_ratio"]) for row in confidence_rows]) if confidence_rows else None,
+            "medium_confidence_ratio": _mean_or_zero([float(row["medium_confidence_ratio"]) for row in confidence_rows]) if confidence_rows else None,
+            "high_confidence_ratio": _mean_or_zero([float(row["high_confidence_ratio"]) for row in confidence_rows]) if confidence_rows else None,
         })
     return aggregated_rows
 
 
 def _aggregate_dataset_row(report_rows: list[dict[str, Any]], per_video_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    confidence_rows = [row for row in report_rows if row.get("foreground_confidence_mean") not in ("", None)]
     return {
         "videos_evaluated": len(per_video_rows),
         "frames_evaluated": len(report_rows),
@@ -697,6 +787,14 @@ def _aggregate_dataset_row(report_rows: list[dict[str, Any]], per_video_rows: li
         "false_positive_pixels": int(sum(int(row["false_positive_pixels"]) for row in report_rows)),
         "false_negative_pixels": int(sum(int(row["false_negative_pixels"]) for row in report_rows)),
         "class_confusion_pixels": int(sum(int(row["class_confusion_pixels"]) for row in report_rows)),
+        "confidence_frames": len(confidence_rows),
+        "foreground_confidence_mean": _mean_or_zero([float(row["foreground_confidence_mean"]) for row in confidence_rows]) if confidence_rows else None,
+        "foreground_confidence_std": _mean_or_zero([float(row["foreground_confidence_std"]) for row in confidence_rows]) if confidence_rows else None,
+        "foreground_confidence_min": min(float(row["foreground_confidence_min"]) for row in confidence_rows) if confidence_rows else None,
+        "foreground_confidence_max": max(float(row["foreground_confidence_max"]) for row in confidence_rows) if confidence_rows else None,
+        "low_confidence_ratio": _mean_or_zero([float(row["low_confidence_ratio"]) for row in confidence_rows]) if confidence_rows else None,
+        "medium_confidence_ratio": _mean_or_zero([float(row["medium_confidence_ratio"]) for row in confidence_rows]) if confidence_rows else None,
+        "high_confidence_ratio": _mean_or_zero([float(row["high_confidence_ratio"]) for row in confidence_rows]) if confidence_rows else None,
     }
 
 
@@ -751,6 +849,38 @@ def _build_worst_frame_rows(report_rows: list[dict[str, Any]], limit: int = 20) 
             "false_positive_pixels": row["false_positive_pixels"],
             "false_negative_pixels": row["false_negative_pixels"],
             "class_confusion_pixels": row["class_confusion_pixels"],
+            "foreground_confidence_mean": row.get("foreground_confidence_mean"),
+            "low_confidence_ratio": row.get("low_confidence_ratio"),
+            "medium_confidence_ratio": row.get("medium_confidence_ratio"),
+            "high_confidence_ratio": row.get("high_confidence_ratio"),
+            "artifact_dir": row["artifact_dir"],
+        }
+        for row in sorted_rows[:limit]
+    ]
+
+
+def _build_lowest_confidence_frame_rows(report_rows: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
+    confidence_rows = [row for row in report_rows if row.get("foreground_confidence_mean") not in ("", None)]
+    sorted_rows = sorted(
+        confidence_rows,
+        key=lambda row: (
+            float(row["foreground_confidence_mean"]),
+            -float(row.get("low_confidence_ratio", 0.0)),
+            row["video_name"],
+            row["frame_name"],
+        ),
+    )
+    return [
+        {
+            "video_name": row["video_name"],
+            "frame_name": row["frame_name"],
+            "foreground_confidence_mean": row.get("foreground_confidence_mean"),
+            "foreground_confidence_std": row.get("foreground_confidence_std"),
+            "foreground_confidence_min": row.get("foreground_confidence_min"),
+            "foreground_confidence_max": row.get("foreground_confidence_max"),
+            "low_confidence_ratio": row.get("low_confidence_ratio"),
+            "medium_confidence_ratio": row.get("medium_confidence_ratio"),
+            "high_confidence_ratio": row.get("high_confidence_ratio"),
             "artifact_dir": row["artifact_dir"],
         }
         for row in sorted_rows[:limit]
@@ -766,6 +896,7 @@ def _write_markdown_report(
     per_class_rows: list[dict[str, Any]],
     worst_video_rows: list[dict[str, Any]],
     worst_frame_rows: list[dict[str, Any]],
+    lowest_confidence_rows: list[dict[str, Any]],
 ) -> None:
     lines = [
         "# Error Analysis Report",
@@ -780,30 +911,49 @@ def _write_markdown_report(
         "",
         "## Per-Video Summary",
         "",
-        "| Video | Frames Evaluated | Macro IoU | Macro Dice | Pixel Accuracy | Error Rate | False Positive Pixels | False Negative Pixels | Class Confusion Pixels |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Video | Frames Evaluated | Macro IoU | Macro Dice | Pixel Accuracy | Error Rate | False Positive Pixels | False Negative Pixels | Class Confusion Pixels | Confidence Frames | Foreground Confidence Mean | Low Confidence Ratio | Medium Confidence Ratio | High Confidence Ratio |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ])
     for row in per_video_rows:
         lines.append(
             f"| {row['video_name']} | {row['frames_evaluated']} | {_format_metric(row['macro_iou'])} | "
             f"{_format_metric(row['macro_dice'])} | {_format_metric(row['pixel_accuracy'])} | "
             f"{_format_metric(row['error_rate'])} | {row['false_positive_pixels']} | "
-            f"{row['false_negative_pixels']} | {row['class_confusion_pixels']} |"
+            f"{row['false_negative_pixels']} | {row['class_confusion_pixels']} | {row['confidence_frames']} | "
+            f"{_format_metric(row['foreground_confidence_mean'])} | {_format_metric(row['low_confidence_ratio'])} | "
+            f"{_format_metric(row['medium_confidence_ratio'])} | {_format_metric(row['high_confidence_ratio'])} |"
         )
 
     lines.extend([
         "",
         "## Dataset Summary",
         "",
-        "| Videos Evaluated | Frames Evaluated | Macro IoU | Macro Dice | Pixel Accuracy | Error Rate | False Positive Pixels | False Negative Pixels | Class Confusion Pixels |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Videos Evaluated | Frames Evaluated | Macro IoU | Macro Dice | Pixel Accuracy | Error Rate | False Positive Pixels | False Negative Pixels | Class Confusion Pixels | Confidence Frames | Foreground Confidence Mean | Foreground Confidence Std | Foreground Confidence Min | Foreground Confidence Max | Low Confidence Ratio | Medium Confidence Ratio | High Confidence Ratio |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         (
             f"| {dataset_row['videos_evaluated']} | {dataset_row['frames_evaluated']} | "
             f"{_format_metric(dataset_row['macro_iou'])} | {_format_metric(dataset_row['macro_dice'])} | "
             f"{_format_metric(dataset_row['pixel_accuracy'])} | {_format_metric(dataset_row['error_rate'])} | "
             f"{dataset_row['false_positive_pixels']} | {dataset_row['false_negative_pixels']} | "
-            f"{dataset_row['class_confusion_pixels']} |"
+            f"{dataset_row['class_confusion_pixels']} | {dataset_row['confidence_frames']} | "
+            f"{_format_metric(dataset_row['foreground_confidence_mean'])} | {_format_metric(dataset_row['foreground_confidence_std'])} | "
+            f"{_format_metric(dataset_row['foreground_confidence_min'])} | {_format_metric(dataset_row['foreground_confidence_max'])} | "
+            f"{_format_metric(dataset_row['low_confidence_ratio'])} | {_format_metric(dataset_row['medium_confidence_ratio'])} | "
+            f"{_format_metric(dataset_row['high_confidence_ratio'])} |"
         ),
+        "",
+        "## Confidence Summary",
+        "",
+        "| Metric | Value |",
+        "| --- | ---: |",
+        f"| Frames With Confidence Maps | {dataset_row['confidence_frames']} |",
+        f"| Foreground Confidence Mean | {_format_metric(dataset_row['foreground_confidence_mean'])} |",
+        f"| Foreground Confidence Std | {_format_metric(dataset_row['foreground_confidence_std'])} |",
+        f"| Foreground Confidence Min | {_format_metric(dataset_row['foreground_confidence_min'])} |",
+        f"| Foreground Confidence Max | {_format_metric(dataset_row['foreground_confidence_max'])} |",
+        f"| Low Confidence Ratio | {_format_metric(dataset_row['low_confidence_ratio'])} |",
+        f"| Medium Confidence Ratio | {_format_metric(dataset_row['medium_confidence_ratio'])} |",
+        f"| High Confidence Ratio | {_format_metric(dataset_row['high_confidence_ratio'])} |",
         "",
         "## Per-Class Summary",
         "",
@@ -851,15 +1001,33 @@ def _write_markdown_report(
         "",
         "### Worst Frames",
         "",
-        "| Video | Frame | Macro IoU | Macro Dice | Pixel Accuracy | Error Rate | False Positive Pixels | False Negative Pixels | Class Confusion Pixels |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Video | Frame | Macro IoU | Macro Dice | Pixel Accuracy | Error Rate | False Positive Pixels | False Negative Pixels | Class Confusion Pixels | Foreground Confidence Mean | Low Confidence Ratio | Medium Confidence Ratio | High Confidence Ratio |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ])
     for row in worst_frame_rows:
         lines.append(
             f"| {row['video_name']} | {row['frame_name']} | {_format_metric(row['macro_iou'])} | "
             f"{_format_metric(row['macro_dice'])} | {_format_metric(row['pixel_accuracy'])} | "
             f"{_format_metric(row['error_rate'])} | {row['false_positive_pixels']} | "
-            f"{row['false_negative_pixels']} | {row['class_confusion_pixels']} |"
+            f"{row['false_negative_pixels']} | {row['class_confusion_pixels']} | "
+            f"{_format_metric(row['foreground_confidence_mean'])} | {_format_metric(row['low_confidence_ratio'])} | "
+            f"{_format_metric(row['medium_confidence_ratio'])} | {_format_metric(row['high_confidence_ratio'])} |"
+        )
+
+    lines.extend([
+        "",
+        "### Lowest Confidence Frames",
+        "",
+        "| Video | Frame | Foreground Confidence Mean | Foreground Confidence Std | Foreground Confidence Min | Foreground Confidence Max | Low Confidence Ratio | Medium Confidence Ratio | High Confidence Ratio |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    for row in lowest_confidence_rows:
+        lines.append(
+            f"| {row['video_name']} | {row['frame_name']} | "
+            f"{_format_metric(row['foreground_confidence_mean'])} | {_format_metric(row['foreground_confidence_std'])} | "
+            f"{_format_metric(row['foreground_confidence_min'])} | {_format_metric(row['foreground_confidence_max'])} | "
+            f"{_format_metric(row['low_confidence_ratio'])} | {_format_metric(row['medium_confidence_ratio'])} | "
+            f"{_format_metric(row['high_confidence_ratio'])} |"
         )
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1024,6 +1192,19 @@ def analyze_predictions(frame_root: Path,
                 "confidence_min": "",
                 "confidence_max": "",
             }
+            foreground_confidence_stats: dict[str, float | int | str] = {
+                "foreground_confidence_mean": "",
+                "foreground_confidence_std": "",
+                "foreground_confidence_min": "",
+                "foreground_confidence_max": "",
+                "foreground_pixels": 0,
+                "low_confidence_pixels": 0,
+                "medium_confidence_pixels": 0,
+                "high_confidence_pixels": 0,
+                "low_confidence_ratio": "",
+                "medium_confidence_ratio": "",
+                "high_confidence_ratio": "",
+            }
             confidence_artifact_path = ""
             if confidence_map is not None:
                 confidence_image = (np.clip(confidence_map, 0.0, 1.0) * 255).astype(np.uint8)
@@ -1036,6 +1217,15 @@ def analyze_predictions(frame_root: Path,
                     "confidence_min": float(confidence_map.min()),
                     "confidence_max": float(confidence_map.max()),
                 }
+                foreground_confidence_stats = _summarize_foreground_confidence(
+                    confidence_map=confidence_map,
+                    pred_mask=pred_mask,
+                    valid_mask=valid_mask,
+                    background_index=dataset_config.background_index,
+                    ignore_index=dataset_config.ignore_index,
+                    low_threshold=low_confidence_threshold,
+                    medium_threshold=medium_confidence_threshold,
+                )
 
             report_rows.append({
                 "video_name": video_name,
@@ -1061,6 +1251,7 @@ def analyze_predictions(frame_root: Path,
                 "per_class_iou": json.dumps(metrics["per_class_iou"]),
                 "per_class_dice": json.dumps(metrics["per_class_dice"]),
                 **confidence_stats,
+                **foreground_confidence_stats,
             })
             summary["videos"][video_name]["frames"] += 1
             summary["frames_analyzed"] += 1
@@ -1077,10 +1268,27 @@ def analyze_predictions(frame_root: Path,
     per_class_rows = _aggregate_class_rows(report_rows, dataset_config)
     worst_video_rows = sorted(per_video_rows, key=lambda row: (float(row["macro_iou"]), -float(row["error_rate"]), row["video_name"]))[:10]
     worst_frame_rows = _build_worst_frame_rows(report_rows)
+    lowest_confidence_rows = _build_lowest_confidence_frame_rows(report_rows)
 
     write_rows_to_csv(output_root / "per_video_summary.csv", per_video_rows, PER_VIDEO_SUMMARY_COLUMNS)
     write_rows_to_csv(output_root / "per_class_summary.csv", per_class_rows, PER_CLASS_SUMMARY_COLUMNS)
     write_rows_to_csv(output_root / "worst_frames.csv", worst_frame_rows, WORST_FRAMES_COLUMNS)
+    write_rows_to_csv(
+        output_root / "lowest_confidence_frames.csv",
+        lowest_confidence_rows,
+        [
+            "video_name",
+            "frame_name",
+            "foreground_confidence_mean",
+            "foreground_confidence_std",
+            "foreground_confidence_min",
+            "foreground_confidence_max",
+            "low_confidence_ratio",
+            "medium_confidence_ratio",
+            "high_confidence_ratio",
+            "artifact_dir",
+        ],
+    )
 
     _write_markdown_report(
         output_root / "report.md",
@@ -1104,6 +1312,7 @@ def analyze_predictions(frame_root: Path,
         per_class_rows=per_class_rows,
         worst_video_rows=worst_video_rows,
         worst_frame_rows=worst_frame_rows,
+        lowest_confidence_rows=lowest_confidence_rows,
     )
 
     if report_rows:
@@ -1120,6 +1329,14 @@ def analyze_predictions(frame_root: Path,
     summary["false_positive_pixels"] = dataset_row["false_positive_pixels"]
     summary["false_negative_pixels"] = dataset_row["false_negative_pixels"]
     summary["class_confusion_pixels"] = dataset_row["class_confusion_pixels"]
+    summary["confidence_frames"] = dataset_row["confidence_frames"]
+    summary["foreground_confidence_mean"] = dataset_row["foreground_confidence_mean"]
+    summary["foreground_confidence_std"] = dataset_row["foreground_confidence_std"]
+    summary["foreground_confidence_min"] = dataset_row["foreground_confidence_min"]
+    summary["foreground_confidence_max"] = dataset_row["foreground_confidence_max"]
+    summary["low_confidence_ratio"] = dataset_row["low_confidence_ratio"]
+    summary["medium_confidence_ratio"] = dataset_row["medium_confidence_ratio"]
+    summary["high_confidence_ratio"] = dataset_row["high_confidence_ratio"]
 
     with (output_root / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)

@@ -91,14 +91,14 @@ def get_distinct_visual_palette(
     vivid_colors = np.array([
         [254, 0, 0],     # red
         [0, 0, 254],     # blue
-        [120, 200, 65],  # green
+        [0, 166, 237],   # cyan
         [255, 196, 0],   # yellow
         [153, 41, 234],  # purple
         [126, 0, 152],   # purple
         [255, 104, 0],   # orange
-        [0, 166, 237],   # cyan
+        [255, 0, 170],   # magenta
         [95, 57, 19],    # brown
-        [0, 128, 128],   # teal
+        [24, 196, 52],   # green
         [128, 128, 0],   # olive
         [0, 0, 128],     # navy
         [170, 0, 0],     # maroon

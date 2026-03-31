@@ -12,6 +12,7 @@ SAM2_DIR = REPO_ROOT / "src" / "sam2"
 EVAL_SCRIPT = SAM2_DIR / "eval_sasvi.py"
 PARALLEL_DISAGREEMENT_SCRIPT = REPO_ROOT / "parallelization_and_streaming" / "parallel_disagreement_sasvi.py"
 TIMED_ORIGINAL_SCRIPT = REPO_ROOT / "parallelization_and_streaming" / "time_original_disagreement_sasvi.py"
+ERROR_ANALYSIS_SCRIPT = REPO_ROOT / "analysis_tools" / "run_error_analysis.py"
 
 
 PRESETS = {
@@ -109,14 +110,8 @@ def default_overseer_checkpoint(dataset_type: str) -> str | None:
 
 
 def default_sam2_checkpoint() -> str:
-    candidates = [
-        REPO_ROOT / "python" / "src" / "sam2" / "sam2" / "checkpoints" / "sam2.1_hiera_large.pt",
-        SAM2_DIR / "sam2" / "checkpoints" / "sam2.1_hiera_large.pt",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate.resolve())
-    return str(candidates[0].resolve())
+    checkpoint_path = SAM2_DIR / "sam2" / "checkpoints" / "sam2.1_hiera_large.pt"
+    return str(checkpoint_path.resolve())
 
 
 def mode_defaults(mode: str) -> dict[str, object]:
@@ -487,6 +482,71 @@ def command_to_string(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
+def build_error_analysis_output_root(run_name: str | None, pred_root: str) -> str:
+    suffix = run_name or Path(pred_root).name
+    return str((REPO_ROOT / "reports" / f"error_analysis_{suffix}").resolve())
+
+
+def build_error_analysis_command(args: argparse.Namespace) -> tuple[list[str], dict[str, object]]:
+    if args.confidence_low_threshold > args.confidence_medium_threshold:
+        raise ValueError("--confidence-low-threshold must be <= --confidence-medium-threshold.")
+
+    dataset = args.dataset or "CHOLECSEG8K"
+    frames_root = resolve_repo_path(args.frames_root)
+    pred_root = resolve_repo_path(args.pred_root)
+    gt_root = resolve_repo_path(args.gt_root)
+    confidence_root = resolve_repo_path(args.confidence_root) if args.confidence_root is not None else None
+    output_root = (
+        resolve_repo_path(args.output_root)
+        if args.output_root is not None
+        else build_error_analysis_output_root(args.run_name, pred_root)
+    )
+
+    command = [
+        sys.executable,
+        str(ERROR_ANALYSIS_SCRIPT),
+        "--frames_root",
+        str(frames_root),
+        "--pred_root",
+        str(pred_root),
+        "--gt_root",
+        str(gt_root),
+        "--output_root",
+        str(output_root),
+        "--dataset_type",
+        str(dataset),
+        "--pred_mask_suffix",
+        str(args.pred_mask_suffix),
+        "--gt_mask_suffix",
+        str(args.gt_mask_suffix),
+        "--image_suffix",
+        str(args.image_suffix),
+        "--confidence_low_threshold",
+        str(args.confidence_low_threshold),
+        "--confidence_medium_threshold",
+        str(args.confidence_medium_threshold),
+    ]
+
+    optional_scalar_args = {
+        "--confidence_root": confidence_root,
+        "--ignore_index": args.ignore_index,
+        "--background_index": args.background_index,
+    }
+    for flag, value in optional_scalar_args.items():
+        if value is not None:
+            command.extend([flag, str(value)])
+
+    resolved = {
+        "dataset": dataset,
+        "frames_root": frames_root,
+        "pred_root": pred_root,
+        "gt_root": gt_root,
+        "confidence_root": confidence_root,
+        "output_root": output_root,
+    }
+    return command, resolved
+
+
 def run_command(args: argparse.Namespace) -> int:
     config = finalize_config(args)
     command = build_parallel_command(config) if is_parallel_mode(str(config["mode"])) else build_eval_command(config)
@@ -508,6 +568,27 @@ def run_command(args: argparse.Namespace) -> int:
 
     run_cwd = REPO_ROOT if is_parallel_mode(str(config["mode"])) else SAM2_DIR
     completed = subprocess.run(command, cwd=run_cwd)
+    return completed.returncode
+
+
+def run_error_analysis_command(args: argparse.Namespace) -> int:
+    command, resolved = build_error_analysis_command(args)
+
+    print("Resolved error-analysis configuration:")
+    print(f"  dataset: {resolved['dataset']}")
+    print(f"  frames_root: {resolved['frames_root']}")
+    print(f"  pred_root: {resolved['pred_root']}")
+    print(f"  gt_root: {resolved['gt_root']}")
+    print(f"  output_root: {resolved['output_root']}")
+    if resolved["confidence_root"] is not None:
+        print(f"  confidence_root: {resolved['confidence_root']}")
+    print("\nCommand:")
+    print(command_to_string(command))
+
+    if args.dry_run:
+        return 0
+
+    completed = subprocess.run(command, cwd=REPO_ROOT)
     return completed.returncode
 
 
@@ -623,11 +704,37 @@ def add_run_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     parser.set_defaults(func=run_command)
 
 
+def add_error_analysis_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("error-analysis", help="Run offline error analysis and write reports under reports/ by default.")
+    parser.add_argument(
+        "--dataset",
+        choices=["CADIS", "CHOLECSEG8K", "CATARACT1K"],
+        default="CHOLECSEG8K",
+        help="Dataset type used to decode RGB masks.",
+    )
+    parser.add_argument("--frames-root", required=True, help="Root directory containing frame folders.")
+    parser.add_argument("--pred-root", required=True, help="Root directory containing predicted RGB masks.")
+    parser.add_argument("--gt-root", required=True, help="Root directory containing ground-truth RGB masks.")
+    parser.add_argument("--confidence-root", help="Optional root directory containing exported confidence maps.")
+    parser.add_argument("--output-root", help="Optional directory for the report bundle. Defaults to reports/error_analysis_<run-name>.")
+    parser.add_argument("--run-name", help="Optional name used to derive the default reports directory.")
+    parser.add_argument("--pred-mask-suffix", default="_rgb_mask.png", help="Filename suffix for predicted masks.")
+    parser.add_argument("--gt-mask-suffix", default="_rgb_mask.png", help="Filename suffix for ground-truth masks.")
+    parser.add_argument("--image-suffix", default=".jpg", help="Filename suffix for input frames.")
+    parser.add_argument("--ignore-index", type=int, help="Optional ignore index override.")
+    parser.add_argument("--background-index", type=int, help="Optional background index override.")
+    parser.add_argument("--confidence-low-threshold", type=float, default=0.35, help="Low-confidence threshold.")
+    parser.add_argument("--confidence-medium-threshold", type=float, default=0.60, help="Medium-confidence threshold.")
+    parser.add_argument("--dry-run", action="store_true", help="Print the resolved command without executing it.")
+    parser.set_defaults(func=run_error_analysis_command)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Root entrypoint for SASVi experiment runs.")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     add_run_subcommand(subparsers)
+    add_error_analysis_subcommand(subparsers)
 
     list_parser = subparsers.add_parser("list-presets", help="List the available run presets.")
     list_parser.set_defaults(func=lambda _args: list_presets())

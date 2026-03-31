@@ -60,12 +60,14 @@ def compute_confidence_map(mask_logits: torch.Tensor,
             f"got {probs.shape[0]} channels and {len(object_ids)} ids"
         )
 
+    logits_np = logits.numpy().astype(np.float32)
     probs_np = probs.numpy().astype(np.float32)
     confidence = 1.0 - probs_np.max(axis=0)
-    thresholded_masks = probs_np > float(score_thresh)
+    thresholded_masks = logits_np > float(score_thresh)
     object_index = {object_id: index for index, object_id in enumerate(object_ids)}
 
-    # Mirror put_per_obj_mask(): higher label ids overwrite lower ones on overlap.
+    # Mirror put_per_obj_mask(): lower label ids win on overlap because the combined
+    # label map is written in descending label order and later writes overwrite earlier ones.
     for object_id in sorted(object_ids, reverse=True):
         mask = thresholded_masks[object_index[object_id]]
         confidence[mask] = probs_np[object_index[object_id]][mask]
