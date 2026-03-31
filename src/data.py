@@ -9,9 +9,6 @@ from scipy.ndimage import label
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from sds_playground.utils.utils import convert_to_binary_mask
-
-
 def get_bb_from_mask(binary_mask: torch.Tensor,
                      components: bool = True,
                      min_comp_fraction: float = 0.0) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
@@ -202,6 +199,7 @@ def prepare_data(images: torch.Tensor,
     :param device: Device literal
     :return: List of training images, target dictionary in Mask R-CNN format
     """
+    from sds_playground.utils.utils import convert_to_binary_mask
 
     binary_masks = convert_to_binary_mask(masks,
                                           num_classes=ds.num_classes,

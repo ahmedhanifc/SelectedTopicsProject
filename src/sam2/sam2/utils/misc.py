@@ -195,7 +195,7 @@ def load_video_frames(
             compute_device=compute_device,
         )
     elif is_str and os.path.isdir(video_path):
-        return load_video_frames_from_jpg_images(
+        return load_video_frames_from_image_folder(
             video_path=video_path,
             image_size=image_size,
             offload_video_to_cpu=offload_video_to_cpu,
@@ -206,11 +206,11 @@ def load_video_frames(
         )
     else:
         raise NotImplementedError(
-            "Only MP4 video and JPEG folder are supported at this moment"
+            "Only MP4 video and image folders are supported at this moment"
         )
 
 
-def load_video_frames_from_jpg_images(
+def load_video_frames_from_image_folder(
     video_path,
     image_size,
     offload_video_to_cpu,
@@ -220,7 +220,7 @@ def load_video_frames_from_jpg_images(
     compute_device=torch.device("cuda"),
 ):
     """
-    Load the video frames from a directory of JPEG files ("<frame_index>.jpg" format).
+    Load the video frames from a directory of image files.
 
     The frames are resized to image_size x image_size and are loaded to GPU if
     `offload_video_to_cpu` is `False` and to CPU if `offload_video_to_cpu` is `True`.
@@ -228,7 +228,7 @@ def load_video_frames_from_jpg_images(
     You can load a frame asynchronously by setting `async_loading_frames` to `True`.
     """
     if isinstance(video_path, str) and os.path.isdir(video_path):
-        jpg_folder = video_path
+        image_folder = video_path
     else:
         raise NotImplementedError(
             "Only JPEG frames are supported at this moment. For video files, you may use "
@@ -242,15 +242,21 @@ def load_video_frames_from_jpg_images(
 
     frame_names = [
         p
-        for p in os.listdir(jpg_folder)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+        for p in os.listdir(image_folder)
+        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG"]
+        and "_mask" not in os.path.splitext(p)[0]
     ]
 
     def _frame_sort_key(name):
         stem = os.path.splitext(name)[0]
         if stem.startswith("frame_"):
-            return int(stem[6:])
-        return int(stem)
+            digits = "".join(ch for ch in stem[6:] if ch.isdigit())
+            if digits:
+                return int(digits)
+        digits = "".join(ch for ch in stem if ch.isdigit())
+        if digits:
+            return int(digits)
+        raise ValueError(f"Unable to sort frame name: {name}")
 
     frame_names.sort(key=_frame_sort_key)
     #TODO: Need to handle this better
@@ -259,8 +265,8 @@ def load_video_frames_from_jpg_images(
 
     num_frames = len(frame_names)
     if num_frames == 0:
-        raise RuntimeError(f"no images found in {jpg_folder}")
-    img_paths = [os.path.join(jpg_folder, frame_name) for frame_name in frame_names]
+        raise RuntimeError(f"no images found in {image_folder}")
+    img_paths = [os.path.join(image_folder, frame_name) for frame_name in frame_names]
     img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
 
@@ -276,7 +282,7 @@ def load_video_frames_from_jpg_images(
         return lazy_images, lazy_images.video_height, lazy_images.video_width
 
     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
-    for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
+    for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (images)")):
         images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
     if not offload_video_to_cpu:
         images = images.to(compute_device)
