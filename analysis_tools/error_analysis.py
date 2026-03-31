@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,38 @@ REPORT_COLUMNS = [
     "gt_classes",
     "per_class_iou",
     "per_class_dice",
+]
+
+PER_VIDEO_SUMMARY_COLUMNS = [
+    "video_name",
+    "frames_evaluated",
+    "macro_iou",
+    "macro_dice",
+    "pixel_accuracy",
+    "error_rate",
+    "false_positive_pixels",
+    "false_negative_pixels",
+    "class_confusion_pixels",
+]
+
+PER_CLASS_SUMMARY_COLUMNS = [
+    "class_id",
+    "frames_present",
+    "mean_iou",
+    "mean_dice",
+]
+
+WORST_FRAMES_COLUMNS = [
+    "video_name",
+    "frame_name",
+    "macro_iou",
+    "macro_dice",
+    "pixel_accuracy",
+    "error_rate",
+    "false_positive_pixels",
+    "false_negative_pixels",
+    "class_confusion_pixels",
+    "artifact_dir",
 ]
 
 
@@ -556,6 +589,262 @@ def _frame_sort_key(path: Path) -> tuple[int, str]:
         return 0, stem
 
 
+def _format_metric(value: float | int | None) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if not np.isfinite(value):
+        return "n/a"
+    return f"{float(value):.4f}"
+
+
+def _mean_or_zero(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return float(np.mean(values))
+
+
+def _dir_has_images(path: Path) -> bool:
+    image_suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file() and Path(entry.name).suffix.lower() in image_suffixes:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _build_logical_video_name_map(root_dir: Path, candidate_names: set[str]) -> dict[str, str]:
+    mapping = {name: name for name in candidate_names}
+    try:
+        top_level_entries = sorted(root_dir.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return mapping
+
+    for entry in top_level_entries:
+        if not entry.is_dir():
+            continue
+        if _dir_has_images(entry):
+            if entry.name in mapping:
+                mapping[entry.name] = entry.name
+            continue
+
+        try:
+            child_entries = sorted(entry.iterdir(), key=lambda path: path.name)
+        except OSError:
+            continue
+
+        for child in child_entries:
+            if child.is_dir() and child.name in mapping and _dir_has_images(child):
+                mapping[child.name] = entry.name
+
+    return mapping
+
+
+def _aggregate_video_rows(report_rows: list[dict[str, Any]], logical_name_map: dict[str, str]) -> list[dict[str, Any]]:
+    grouped_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in report_rows:
+        logical_name = logical_name_map.get(row["video_name"], row["video_name"])
+        grouped_rows.setdefault(logical_name, []).append(row)
+
+    aggregated_rows: list[dict[str, Any]] = []
+    for logical_name in sorted(grouped_rows):
+        rows = grouped_rows[logical_name]
+        aggregated_rows.append({
+            "video_name": logical_name,
+            "frames_evaluated": len(rows),
+            "macro_iou": _mean_or_zero([float(row["macro_iou"]) for row in rows]),
+            "macro_dice": _mean_or_zero([float(row["macro_dice"]) for row in rows]),
+            "pixel_accuracy": _mean_or_zero([float(row["pixel_accuracy"]) for row in rows]),
+            "error_rate": _mean_or_zero([float(row["error_rate"]) for row in rows]),
+            "false_positive_pixels": int(sum(int(row["false_positive_pixels"]) for row in rows)),
+            "false_negative_pixels": int(sum(int(row["false_negative_pixels"]) for row in rows)),
+            "class_confusion_pixels": int(sum(int(row["class_confusion_pixels"]) for row in rows)),
+        })
+    return aggregated_rows
+
+
+def _aggregate_dataset_row(report_rows: list[dict[str, Any]], per_video_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "videos_evaluated": len(per_video_rows),
+        "frames_evaluated": len(report_rows),
+        "macro_iou": _mean_or_zero([float(row["macro_iou"]) for row in report_rows]),
+        "macro_dice": _mean_or_zero([float(row["macro_dice"]) for row in report_rows]),
+        "pixel_accuracy": _mean_or_zero([float(row["pixel_accuracy"]) for row in report_rows]),
+        "error_rate": _mean_or_zero([float(row["error_rate"]) for row in report_rows]),
+        "false_positive_pixels": int(sum(int(row["false_positive_pixels"]) for row in report_rows)),
+        "false_negative_pixels": int(sum(int(row["false_negative_pixels"]) for row in report_rows)),
+        "class_confusion_pixels": int(sum(int(row["class_confusion_pixels"]) for row in report_rows)),
+    }
+
+
+def _aggregate_class_rows(report_rows: list[dict[str, Any]], dataset_config: DatasetConfig) -> list[dict[str, Any]]:
+    per_class_values: dict[int, dict[str, list[float] | int]] = {
+        class_id: {"iou_values": [], "dice_values": [], "frames_present": 0}
+        for class_id in range(dataset_config.num_classes)
+    }
+    if dataset_config.ignore_index is not None:
+        per_class_values.setdefault(int(dataset_config.ignore_index), {"iou_values": [], "dice_values": [], "frames_present": 0})
+
+    for row in report_rows:
+        per_class_iou = json.loads(row["per_class_iou"])
+        per_class_dice = json.loads(row["per_class_dice"])
+        class_ids = set(per_class_iou.keys()) | set(per_class_dice.keys())
+        for class_id_str in class_ids:
+            class_id = int(class_id_str)
+            bucket = per_class_values.setdefault(class_id, {"iou_values": [], "dice_values": [], "frames_present": 0})
+            if class_id_str in per_class_iou:
+                bucket["iou_values"].append(float(per_class_iou[class_id_str]))  # type: ignore[index]
+            if class_id_str in per_class_dice:
+                bucket["dice_values"].append(float(per_class_dice[class_id_str]))  # type: ignore[index]
+            bucket["frames_present"] = int(bucket["frames_present"]) + 1
+
+    class_rows: list[dict[str, Any]] = []
+    for class_id in sorted(per_class_values):
+        bucket = per_class_values[class_id]
+        if int(bucket["frames_present"]) == 0:
+            continue
+        class_rows.append({
+            "class_id": class_id,
+            "frames_present": int(bucket["frames_present"]),
+            "mean_iou": _mean_or_zero(list(bucket["iou_values"])),  # type: ignore[arg-type]
+            "mean_dice": _mean_or_zero(list(bucket["dice_values"])),  # type: ignore[arg-type]
+        })
+    return class_rows
+
+
+def _build_worst_frame_rows(report_rows: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
+    sorted_rows = sorted(
+        report_rows,
+        key=lambda row: (float(row["macro_iou"]), -float(row["error_rate"]), row["video_name"], row["frame_name"]),
+    )
+    return [
+        {
+            "video_name": row["video_name"],
+            "frame_name": row["frame_name"],
+            "macro_iou": row["macro_iou"],
+            "macro_dice": row["macro_dice"],
+            "pixel_accuracy": row["pixel_accuracy"],
+            "error_rate": row["error_rate"],
+            "false_positive_pixels": row["false_positive_pixels"],
+            "false_negative_pixels": row["false_negative_pixels"],
+            "class_confusion_pixels": row["class_confusion_pixels"],
+            "artifact_dir": row["artifact_dir"],
+        }
+        for row in sorted_rows[:limit]
+    ]
+
+
+def _write_markdown_report(
+    path: Path,
+    *,
+    config: dict[str, Any],
+    per_video_rows: list[dict[str, Any]],
+    dataset_row: dict[str, Any],
+    per_class_rows: list[dict[str, Any]],
+    worst_video_rows: list[dict[str, Any]],
+    worst_frame_rows: list[dict[str, Any]],
+) -> None:
+    lines = [
+        "# Error Analysis Report",
+        "",
+        "## Configuration",
+        "",
+    ]
+    for key, value in config.items():
+        lines.append(f"- `{key}`: `{value}`")
+
+    lines.extend([
+        "",
+        "## Per-Video Summary",
+        "",
+        "| Video | Frames Evaluated | Macro IoU | Macro Dice | Pixel Accuracy | Error Rate | False Positive Pixels | False Negative Pixels | Class Confusion Pixels |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    for row in per_video_rows:
+        lines.append(
+            f"| {row['video_name']} | {row['frames_evaluated']} | {_format_metric(row['macro_iou'])} | "
+            f"{_format_metric(row['macro_dice'])} | {_format_metric(row['pixel_accuracy'])} | "
+            f"{_format_metric(row['error_rate'])} | {row['false_positive_pixels']} | "
+            f"{row['false_negative_pixels']} | {row['class_confusion_pixels']} |"
+        )
+
+    lines.extend([
+        "",
+        "## Dataset Summary",
+        "",
+        "| Videos Evaluated | Frames Evaluated | Macro IoU | Macro Dice | Pixel Accuracy | Error Rate | False Positive Pixels | False Negative Pixels | Class Confusion Pixels |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        (
+            f"| {dataset_row['videos_evaluated']} | {dataset_row['frames_evaluated']} | "
+            f"{_format_metric(dataset_row['macro_iou'])} | {_format_metric(dataset_row['macro_dice'])} | "
+            f"{_format_metric(dataset_row['pixel_accuracy'])} | {_format_metric(dataset_row['error_rate'])} | "
+            f"{dataset_row['false_positive_pixels']} | {dataset_row['false_negative_pixels']} | "
+            f"{dataset_row['class_confusion_pixels']} |"
+        ),
+        "",
+        "## Per-Class Summary",
+        "",
+        "| Class ID | Frames Present | Mean IoU | Mean Dice |",
+        "| ---: | ---: | ---: | ---: |",
+    ])
+    for row in per_class_rows:
+        lines.append(
+            f"| {row['class_id']} | {row['frames_present']} | "
+            f"{_format_metric(row['mean_iou'])} | {_format_metric(row['mean_dice'])} |"
+        )
+
+    total_error_pixels = (
+        int(dataset_row["false_positive_pixels"])
+        + int(dataset_row["false_negative_pixels"])
+        + int(dataset_row["class_confusion_pixels"])
+    )
+    lines.extend([
+        "",
+        "## Error Breakdown",
+        "",
+        "| Metric | Value |",
+        "| --- | ---: |",
+        f"| False Positive Pixels | {dataset_row['false_positive_pixels']} |",
+        f"| False Negative Pixels | {dataset_row['false_negative_pixels']} |",
+        f"| Class Confusion Pixels | {dataset_row['class_confusion_pixels']} |",
+        f"| Total Error Pixels | {total_error_pixels} |",
+        "",
+        "## Worst Videos / Worst Frames",
+        "",
+        "### Worst Videos",
+        "",
+        "| Video | Frames Evaluated | Macro IoU | Macro Dice | Pixel Accuracy | Error Rate | False Positive Pixels | False Negative Pixels | Class Confusion Pixels |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    for row in worst_video_rows:
+        lines.append(
+            f"| {row['video_name']} | {row['frames_evaluated']} | {_format_metric(row['macro_iou'])} | "
+            f"{_format_metric(row['macro_dice'])} | {_format_metric(row['pixel_accuracy'])} | "
+            f"{_format_metric(row['error_rate'])} | {row['false_positive_pixels']} | "
+            f"{row['false_negative_pixels']} | {row['class_confusion_pixels']} |"
+        )
+
+    lines.extend([
+        "",
+        "### Worst Frames",
+        "",
+        "| Video | Frame | Macro IoU | Macro Dice | Pixel Accuracy | Error Rate | False Positive Pixels | False Negative Pixels | Class Confusion Pixels |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    for row in worst_frame_rows:
+        lines.append(
+            f"| {row['video_name']} | {row['frame_name']} | {_format_metric(row['macro_iou'])} | "
+            f"{_format_metric(row['macro_dice'])} | {_format_metric(row['pixel_accuracy'])} | "
+            f"{_format_metric(row['error_rate'])} | {row['false_positive_pixels']} | "
+            f"{row['false_negative_pixels']} | {row['class_confusion_pixels']} |"
+        )
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def analyze_predictions(frame_root: Path,
                         pred_root: Path,
                         gt_root: Path,
@@ -759,6 +1048,44 @@ def analyze_predictions(frame_root: Path,
     output_root.mkdir(parents=True, exist_ok=True)
     write_rows_to_csv(output_root / "analysis.csv", report_rows, REPORT_COLUMNS)
 
+    logical_name_map = _build_logical_video_name_map(
+        frame_root,
+        {str(row["video_name"]) for row in report_rows},
+    )
+    per_video_rows = _aggregate_video_rows(report_rows, logical_name_map)
+    dataset_row = _aggregate_dataset_row(report_rows, per_video_rows)
+    per_class_rows = _aggregate_class_rows(report_rows, dataset_config)
+    worst_video_rows = sorted(per_video_rows, key=lambda row: (float(row["macro_iou"]), -float(row["error_rate"]), row["video_name"]))[:10]
+    worst_frame_rows = _build_worst_frame_rows(report_rows)
+
+    write_rows_to_csv(output_root / "per_video_summary.csv", per_video_rows, PER_VIDEO_SUMMARY_COLUMNS)
+    write_rows_to_csv(output_root / "per_class_summary.csv", per_class_rows, PER_CLASS_SUMMARY_COLUMNS)
+    write_rows_to_csv(output_root / "worst_frames.csv", worst_frame_rows, WORST_FRAMES_COLUMNS)
+
+    _write_markdown_report(
+        output_root / "report.md",
+        config={
+            "dataset_type": dataset_config.dataset_type,
+            "frames_root": str(frame_root),
+            "pred_root": str(pred_root),
+            "gt_root": str(gt_root),
+            "output_root": str(output_root),
+            "confidence_root": str(confidence_root) if confidence_root is not None else None,
+            "pred_mask_suffix": pred_mask_suffix,
+            "gt_mask_suffix": gt_mask_suffix,
+            "image_suffix": image_suffix,
+            "ignore_index": dataset_config.ignore_index,
+            "background_index": dataset_config.background_index,
+            "confidence_low_threshold": low_confidence_threshold,
+            "confidence_medium_threshold": medium_confidence_threshold,
+        },
+        per_video_rows=per_video_rows,
+        dataset_row=dataset_row,
+        per_class_rows=per_class_rows,
+        worst_video_rows=worst_video_rows,
+        worst_frame_rows=worst_frame_rows,
+    )
+
     if report_rows:
         summary["macro_iou_mean"] = float(np.mean([row["macro_iou"] for row in report_rows]))
         summary["macro_dice_mean"] = float(np.mean([row["macro_dice"] for row in report_rows]))
@@ -769,6 +1096,10 @@ def analyze_predictions(frame_root: Path,
         summary["macro_dice_mean"] = 0.0
         summary["pixel_accuracy_mean"] = 0.0
         summary["error_rate_mean"] = 0.0
+    summary["videos_evaluated"] = dataset_row["videos_evaluated"]
+    summary["false_positive_pixels"] = dataset_row["false_positive_pixels"]
+    summary["false_negative_pixels"] = dataset_row["false_negative_pixels"]
+    summary["class_confusion_pixels"] = dataset_row["class_confusion_pixels"]
 
     with (output_root / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
