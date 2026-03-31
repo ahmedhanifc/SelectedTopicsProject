@@ -57,20 +57,13 @@ The report generator matches by:
 - video directory name
 - frame stem
 
-When confidence maps are available, the error map applies pattern bands only on
-the `Correct / no error` region so you can distinguish low-, medium-, and
-high-confidence correct predictions without changing the existing error colors.
-
 ## Output artifacts
 
 For each analyzed frame, the report saves:
 
 - `<frame>_image.png`
 - `<frame>_pred_rgb.png`
-- `<frame>_pred_confidence_pattern.png` for the prediction mask with disagreement-style confidence striping
 - `<frame>_gt_rgb.png`
-- `<frame>_error_map.png` for the image-backed error view
-- `<frame>_error_map_mask.png` for the RGB-mask-backed error view
+- `<frame>_error_map.png`
 - `<frame>_confidence.png` if available
-- `<frame>_overlay.png` for the image-backed composite
-- `<frame>_overlay_mask.png` for the image-backed composite with only the error panel using the RGB mask backdrop
+- `<frame>_overlay.png`

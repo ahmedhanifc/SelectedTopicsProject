@@ -28,7 +28,6 @@ from scipy.ndimage import find_objects
 from scipy.spatial.distance import cdist
 import albumentations as A
 import torchvision.transforms as T
-from tqdm import tqdm
 from transformers import DetrImageProcessor, DetrForSegmentation, Mask2FormerForUniversalSegmentation, Mask2FormerImageProcessor
 
 try:
@@ -107,7 +106,7 @@ from analysis_tools.inference_export import (
     write_rows_to_csv,
     write_markdown_report,
 )
-from analysis_tools.config import get_dataset_config, get_distinct_visual_palette
+from analysis_tools.config import get_dataset_config
 from analysis_tools.error_analysis import compute_frame_metrics, load_dataset_mask
 
 
@@ -387,30 +386,20 @@ def compute_binary_iou(mask_a, mask_b):
     return float(intersection / union)
 
 
-def compute_classwise_iou(per_obj_mask_a, per_obj_mask_b, height, width, min_label_area=0):
+def compute_classwise_iou(per_obj_mask_a, per_obj_mask_b, height, width):
     labels = sorted(set(per_obj_mask_a) | set(per_obj_mask_b))
     if not labels:
-        return 1.0, {}, {}
+        return 1.0, {}
 
     per_class_iou = {}
-    per_class_area = {}
     empty_mask = np.zeros((height, width), dtype=bool)
     for label in labels:
         mask_a = np.asarray(per_obj_mask_a.get(label, empty_mask), dtype=bool).reshape(height, width)
         mask_b = np.asarray(per_obj_mask_b.get(label, empty_mask), dtype=bool).reshape(height, width)
-        label_area = int(np.logical_or(mask_a, mask_b).sum())
-        if label_area < min_label_area:
-            continue
         per_class_iou[label] = compute_binary_iou(mask_a, mask_b)
-        per_class_area[label] = label_area
 
-    if not per_class_iou:
-        return 1.0, {}, {}
-
-    weights = np.array(list(per_class_area.values()), dtype=np.float64)
-    values = np.array(list(per_class_iou.values()), dtype=np.float64)
-    mean_iou = float(np.average(values, weights=weights))
-    return mean_iou, per_class_iou, per_class_area
+    mean_iou = float(np.mean(list(per_class_iou.values())))
+    return mean_iou, per_class_iou
 
 
 def compute_boundary_distance(mask_a, mask_b):
@@ -437,19 +426,12 @@ def compute_boundary_distance(mask_a, mask_b):
     return float(symmetric_distance)
 
 
-def compute_disagreement_metrics(
-    per_obj_sam_mask,
-    per_obj_overseer_mask,
-    height,
-    width,
-    disagreement_min_label_area=0,
-):
-    mean_iou, per_class_iou, per_class_area = compute_classwise_iou(
+def compute_disagreement_metrics(per_obj_sam_mask, per_obj_overseer_mask, height, width):
+    mean_iou, per_class_iou = compute_classwise_iou(
         per_obj_mask_a=per_obj_sam_mask,
         per_obj_mask_b=per_obj_overseer_mask,
         height=height,
         width=width,
-        min_label_area=disagreement_min_label_area,
     )
     sam_foreground = per_obj_mask_to_foreground(per_obj_sam_mask, height, width)
     overseer_foreground = per_obj_mask_to_foreground(per_obj_overseer_mask, height, width)
@@ -458,7 +440,6 @@ def compute_disagreement_metrics(
         "iou": mean_iou,
         "foreground_iou": foreground_iou,
         "per_class_iou": per_class_iou,
-        "per_class_area": per_class_area,
         "sam_foreground": sam_foreground,
         "overseer_foreground": overseer_foreground,
     }
@@ -479,7 +460,34 @@ def save_disagreement_visual(path, frame_path, sam_foreground, overseer_foregrou
 
 
 def get_primary_visual_palette(num_classes):
-    return get_distinct_visual_palette(num_classes=num_classes, background_index=0)
+    base_colors = np.array([
+        [127, 127, 127],  # background
+        [255, 0, 0],      # red
+        [0, 0, 255],      # blue
+        [0, 200, 0],      # green
+        [255, 255, 0],    # yellow
+        [255, 0, 255],    # magenta
+        [0, 255, 255],    # cyan
+        [255, 128, 0],    # orange
+        [128, 0, 255],    # violet
+        [139, 69, 19],    # brown
+        [255, 255, 255],  # white
+        [0, 0, 0],        # black
+        [0, 128, 128],    # teal
+        [128, 128, 0],    # olive
+        [128, 0, 0],      # maroon
+        [0, 128, 0],      # dark green
+        [0, 128, 255],    # azure
+        [255, 0, 128],    # rose
+        [64, 64, 255],    # strong periwinkle
+        [0, 180, 120],    # sea green
+    ], dtype=np.uint8)
+    if num_classes <= len(base_colors):
+        return base_colors[:num_classes]
+    extra = []
+    for idx in range(len(base_colors), num_classes):
+        extra.append([(53 * idx) % 256, (97 * idx) % 256, (193 * idx) % 256])
+    return np.vstack([base_colors, np.array(extra, dtype=np.uint8)])
 
 
 def smooth_label_map(label_map, fill_value):
@@ -879,14 +887,11 @@ def sasvi_inference(
     analysis_output_dir=None,
     enable_disagreement_gate=False,
     disagreement_iou_threshold=0.5,
-    disagreement_foreground_iou_threshold=0.98,
-    disagreement_min_label_area=100,
     disagreement_bad_frames=2,
     enable_boundary_distance_gate=False,
     boundary_distance_threshold=20.0,
     save_disagreement_visuals=False,
     max_disagreement_visuals=10,
-    disable_tqdm=False,
 ):
     """Run inference on a single video with the given predictor."""
     video_dir = video_dir or os.path.join(base_video_dir, video_name)
@@ -936,17 +941,10 @@ def sasvi_inference(
     break_endless_loop = False
     inference_rows = {}
     confidence_dir = None
-    raw_confidence_dir = None
-    smoothed_confidence_dir = None
     disagreement_visual_dir = None
     if analysis_output_dir is not None:
-        confidence_root_dir = os.path.join(analysis_output_dir, "inference", "confidence_maps")
-        confidence_dir = os.path.join(confidence_root_dir, video_name)  # legacy raw path
-        raw_confidence_dir = os.path.join(confidence_root_dir, "raw", video_name)
-        smoothed_confidence_dir = os.path.join(confidence_root_dir, "smoothed", video_name)
+        confidence_dir = os.path.join(analysis_output_dir, "inference", "confidence_maps", video_name)
         os.makedirs(confidence_dir, exist_ok=True)
-        os.makedirs(raw_confidence_dir, exist_ok=True)
-        os.makedirs(smoothed_confidence_dir, exist_ok=True)
         if save_disagreement_visuals:
             disagreement_visual_dir = os.path.join(
                 analysis_output_dir, "inference", "disagreement_visuals", video_name
@@ -983,216 +981,186 @@ def sasvi_inference(
     break_endless_loop = False
     disagreement_visual_count = 0
     idx = 0
-    max_completed_frame_idx = -1
-    frame_progress = tqdm(
-        total=len(frame_names),
-        desc=f"{video_name}",
-        unit="frame",
-        leave=False,
-        disable=disable_tqdm,
-    )
-    try:
-        while idx < len(frame_names):
-            segment_id = video_summary["segments_started"] + 1
-            video_summary["segments_started"] += 1
-            segment_start_idx = idx
-            disagreement_counter = 0
+    while idx < len(frame_names):
+        segment_id = video_summary["segments_started"] + 1
+        video_summary["segments_started"] += 1
+        segment_start_idx = idx
+        disagreement_counter = 0
 
-            # clear the prompts from previous runs
-            print(f"[segment] video={video_name} segment={segment_id} start_frame={frame_names[idx]} idx={idx}")
-            predictor.reset_state(inference_state=inference_state)
-            buffer_length = 25
+        # clear the prompts from previous runs
+        print(f"[segment] video={video_name} segment={segment_id} start_frame={frame_names[idx]} idx={idx}")
+        predictor.reset_state(inference_state=inference_state)
+        buffer_length = 25
 
-            # clean up the cached mask if it gets too big. Slightly larger than future_n_frame length
-            MAX_CACHE_SIZE = 20
-            while len(per_obj_input_mask_cached) > MAX_CACHE_SIZE:
-                smallest_idx = min(per_obj_input_mask_cached.keys())
-                del per_obj_input_mask_cached[smallest_idx]
+        # clean up the cached mask if it gets too big. Slightly larger than future_n_frame length
+        MAX_CACHE_SIZE = 20
+        while len(per_obj_input_mask_cached) > MAX_CACHE_SIZE:
+            smallest_idx = min(per_obj_input_mask_cached.keys())
+            del per_obj_input_mask_cached[smallest_idx]
 
-            # this loads the masks. will add those input masks to SAM 2 inference state before propagations
-            per_obj_input_mask = ensure_cached_overseer_prediction(
-                cache=per_obj_input_mask_cached,
+        # this loads the masks. will add those input masks to SAM 2 inference state before propagations
+        per_obj_input_mask = ensure_cached_overseer_prediction(
+            cache=per_obj_input_mask_cached,
+            frame_idx=idx,
+            frame_names=frame_names,
+            frame_path_by_name=frame_path_by_name,
+            overseer_model=overseer_model,
+            reshape_size=(height, width),
+        )
+
+        if idx > 0:
+            # to make it more stable, if something ignored in overseer frame, but detected in previous sam2 frame, add it to the prompt mask
+            # but didnt work for cat1k and cholec80 bcs it slowly covers the background which should have no label
+            if dataset_type == "CADIS":
+                per_obj_previous_mask = get_per_obj_mask(
+                                            mask_path=os.path.join(raw_output_mask_dir, video_name), 
+                                            frame_name=frame_names[idx],
+                                            use_binary_mask=False, 
+                                            width=width, 
+                                            height=height,
+                                            ignore_indices=ignore_indices, 
+                                            shift_by_1=shift_by_1, 
+                                            palette=palette)
+            
+                ignore_class_input_mask = ~np.array(list(per_obj_input_mask.values())).any(axis=0)
+                ignore_class_previous_mask = ~np.array(list(per_obj_previous_mask.values())).any(axis=0)
+                additional_points = np.argwhere(ignore_class_input_mask & ~ignore_class_previous_mask)
+                merged_previous_mask = put_per_obj_mask(per_obj_previous_mask, height, width, shift_by_1)
+                for pos in additional_points:
+                    val = merged_previous_mask[tuple(pos)]
+                    if val in list(set(old_label) & set(current_label)):
+                        per_obj_input_mask[val][tuple(pos)] = True
+
+            for obj_id in prompt_label_list:
+                # adding positive points for new objects
+                selected_point = get_points_from_mask(per_obj_input_mask, label_ids=[obj_id])
+                if selected_point[obj_id]:
+                    points = np.array(selected_point[obj_id], dtype=np.float32)
+                    labels = np.ones((len(selected_point[obj_id]),), dtype=np.int32) 
+                    predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=idx,
+                        obj_id=obj_id,
+                        points=points,
+                        labels=labels,
+                    )
+
+                # since mask have inaccurate label at positions where new tool is occupied, modify those areas to be false        
+                false_positions = np.argwhere(per_obj_input_mask[obj_id])
+                for obj_input_mask in per_obj_input_mask:
+                    # sometimes sam2 is already correctly guessing them, so we dont want to disable those areas
+                        if obj_input_mask != obj_id:
+                            for false_pos in false_positions:
+                                per_obj_input_mask[obj_input_mask][tuple(false_pos)] = False
+
+            # update the old label 
+            yet_another_unique_label = old_label
+            break_endless_loop = True
+            negative_duplicate_list = [x for xs in negative_duplicate_list for x in xs]
+            old_label = list((((set(old_label) & set(current_label)) | set(prompt_label_list)) - set(negative_duplicate_list)))
+        else:
+            yet_another_unique_label = []
+            negative_duplicate_list = []
+
+        # add the corrected mask to predictor
+        for object_id, object_mask in per_obj_input_mask.items():
+            if idx == 0 or (idx > 0 and object_id in yet_another_unique_label and object_id not in negative_duplicate_list):
+                predictor.add_new_mask(
+                    inference_state=inference_state,
+                    frame_idx=idx,
+                    obj_id=object_id,
+                    mask=object_mask,
+                )
+        
+        if len(inference_state['point_inputs_per_obj']) == 0 and len(inference_state['mask_inputs_per_obj']) == 0:
+            print("Empty overseer mask, using dummy background point prompt. Happens when camera move out of scene.")
+            dummy_id = num_classes if shift_by_1 else 0
+            dummy_mask = np.zeros((height, width), dtype=bool)
+            predictor.add_new_mask(
+                inference_state=inference_state,
                 frame_idx=idx,
+                obj_id=dummy_id,
+                mask=dummy_mask,
+            )
+
+        trigger_next_idx = None
+        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state): 
+            idx = out_frame_idx
+            per_obj_output_mask = {
+                out_obj_id: (out_mask_logits[i] > score_thresh).cpu().numpy()
+                for i, out_obj_id in enumerate(out_obj_ids)
+            }
+            current_overseer_mask = ensure_cached_overseer_prediction(
+                cache=per_obj_input_mask_cached,
+                frame_idx=out_frame_idx,
                 frame_names=frame_names,
                 frame_path_by_name=frame_path_by_name,
                 overseer_model=overseer_model,
                 reshape_size=(height, width),
             )
-
-            if idx > 0:
-                # to make it more stable, if something ignored in overseer frame, but detected in previous sam2 frame, add it to the prompt mask
-                # but didnt work for cat1k and cholec80 bcs it slowly covers the background which should have no label
-                if dataset_type == "CADIS":
-                    per_obj_previous_mask = get_per_obj_mask(
-                                                mask_path=os.path.join(raw_output_mask_dir, video_name), 
-                                                frame_name=frame_names[idx],
-                                                use_binary_mask=False, 
-                                                width=width, 
-                                                height=height,
-                                                ignore_indices=ignore_indices, 
-                                                shift_by_1=shift_by_1, 
-                                                palette=palette)
-                
-                    ignore_class_input_mask = ~np.array(list(per_obj_input_mask.values())).any(axis=0)
-                    ignore_class_previous_mask = ~np.array(list(per_obj_previous_mask.values())).any(axis=0)
-                    additional_points = np.argwhere(ignore_class_input_mask & ~ignore_class_previous_mask)
-                    merged_previous_mask = put_per_obj_mask(per_obj_previous_mask, height, width, shift_by_1)
-                    for pos in additional_points:
-                        val = merged_previous_mask[tuple(pos)]
-                        if val in list(set(old_label) & set(current_label)):
-                            per_obj_input_mask[val][tuple(pos)] = True
-
-                for obj_id in prompt_label_list:
-                    # adding positive points for new objects
-                    selected_point = get_points_from_mask(per_obj_input_mask, label_ids=[obj_id])
-                    if selected_point[obj_id]:
-                        points = np.array(selected_point[obj_id], dtype=np.float32)
-                        labels = np.ones((len(selected_point[obj_id]),), dtype=np.int32) 
-                        predictor.add_new_points_or_box(
-                            inference_state=inference_state,
-                            frame_idx=idx,
-                            obj_id=obj_id,
-                            points=points,
-                            labels=labels,
-                        )
-
-                    # since mask have inaccurate label at positions where new tool is occupied, modify those areas to be false        
-                    false_positions = np.argwhere(per_obj_input_mask[obj_id])
-                    for obj_input_mask in per_obj_input_mask:
-                        # sometimes sam2 is already correctly guessing them, so we dont want to disable those areas
-                            if obj_input_mask != obj_id:
-                                for false_pos in false_positions:
-                                    per_obj_input_mask[obj_input_mask][tuple(false_pos)] = False
-
-                # update the old label 
-                yet_another_unique_label = old_label
-                break_endless_loop = True
-                negative_duplicate_list = [x for xs in negative_duplicate_list for x in xs]
-                old_label = list((((set(old_label) & set(current_label)) | set(prompt_label_list)) - set(negative_duplicate_list)))
-            else:
-                yet_another_unique_label = []
-                negative_duplicate_list = []
-
-            # add the corrected mask to predictor
-            for object_id, object_mask in per_obj_input_mask.items():
-                if idx == 0 or (idx > 0 and object_id in yet_another_unique_label and object_id not in negative_duplicate_list):
-                    predictor.add_new_mask(
-                        inference_state=inference_state,
-                        frame_idx=idx,
-                        obj_id=object_id,
-                        mask=object_mask,
-                    )
-            
-            if len(inference_state['point_inputs_per_obj']) == 0 and len(inference_state['mask_inputs_per_obj']) == 0:
-                print("Empty overseer mask, using dummy background point prompt. Happens when camera move out of scene.")
-                dummy_id = num_classes if shift_by_1 else 0
-                dummy_mask = np.zeros((height, width), dtype=bool)
-                predictor.add_new_mask(
-                    inference_state=inference_state,
-                    frame_idx=idx,
-                    obj_id=dummy_id,
-                    mask=dummy_mask,
+            disagreement_metrics = compute_disagreement_metrics(
+                per_obj_sam_mask=per_obj_output_mask,
+                per_obj_overseer_mask=current_overseer_mask,
+                height=height,
+                width=width,
+            )
+            boundary_distance = None
+            if enable_boundary_distance_gate:
+                boundary_distance = compute_boundary_distance(
+                    disagreement_metrics["sam_foreground"],
+                    disagreement_metrics["overseer_foreground"],
                 )
 
-            trigger_next_idx = None
-            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state): 
-                idx = out_frame_idx
-                if out_frame_idx > max_completed_frame_idx:
-                    frame_progress.update(out_frame_idx - max_completed_frame_idx)
-                    max_completed_frame_idx = out_frame_idx
-                per_obj_output_mask = {
-                    out_obj_id: (out_mask_logits[i] > score_thresh).cpu().numpy()
-                    for i, out_obj_id in enumerate(out_obj_ids)
+            if confidence_dir is not None and len(out_obj_ids) > 0:
+                confidence_map = compute_confidence_map(out_mask_logits)
+                confidence_path = os.path.join(
+                    confidence_dir,
+                    f"{frame_names[out_frame_idx]}_confidence.png",
+                )
+                save_confidence_map(confidence_path, confidence_map)
+                confidence_stats = summarise_confidence_map(confidence_map)
+                inference_rows[frame_names[out_frame_idx]] = {
+                    "video_name": video_name,
+                    "frame_name": frame_names[out_frame_idx],
+                    "frame_idx": out_frame_idx,
+                    "segment_id": segment_id,
+                    "num_objects": len(out_obj_ids),
+                    "confidence_path": confidence_path,
+                    **confidence_stats,
                 }
-                current_overseer_mask = ensure_cached_overseer_prediction(
-                    cache=per_obj_input_mask_cached,
-                    frame_idx=out_frame_idx,
-                    frame_names=frame_names,
-                    frame_path_by_name=frame_path_by_name,
-                    overseer_model=overseer_model,
-                    reshape_size=(height, width),
-                )
-                disagreement_metrics = compute_disagreement_metrics(
-                    per_obj_sam_mask=per_obj_output_mask,
-                    per_obj_overseer_mask=current_overseer_mask,
-                    height=height,
-                    width=width,
-                    disagreement_min_label_area=disagreement_min_label_area,
-                )
-                pred_label_map = per_obj_mask_to_label_map(
-                    per_obj_mask=per_obj_output_mask,
-                    height=height,
-                    width=width,
-                    shift_by_1=shift_by_1,
-                )
-                boundary_distance = None
-                if enable_boundary_distance_gate:
-                    boundary_distance = compute_boundary_distance(
-                        disagreement_metrics["sam_foreground"],
-                        disagreement_metrics["overseer_foreground"],
-                    )
+            else:
+                inference_rows[frame_names[out_frame_idx]] = {
+                    "video_name": video_name,
+                    "frame_name": frame_names[out_frame_idx],
+                    "frame_idx": out_frame_idx,
+                    "segment_id": segment_id,
+                    "num_objects": len(out_obj_ids),
+                    "confidence_path": None,
+                    "confidence_mean": None,
+                    "confidence_std": None,
+                    "confidence_min": None,
+                    "confidence_max": None,
+                }
+            # write the output masks as palette PNG files to output_mask_dir
+            save_masks_to_dir(
+                output_mask_dir=output_mask_dir,
+                video_name=video_name,
+                frame_name=frame_names[out_frame_idx],
+                per_obj_output_mask=per_obj_output_mask,
+                height=height,
+                width=width,
+                output_palette=palette,
+                save_binary_mask=save_binary_mask,
+                num_classes=num_classes,
+                shift_by_1=shift_by_1,
+            )
 
-                if confidence_dir is not None and len(out_obj_ids) > 0:
-                    fill_value = 255 if shift_by_1 else 0
-                    smoothed_pred_label_map = smooth_label_map(pred_label_map, fill_value=fill_value)
-                    confidence_map = compute_confidence_map(
-                        out_mask_logits,
-                        object_ids=out_obj_ids,
-                        score_thresh=score_thresh,
-                        final_label_map=pred_label_map,
-                        background_label=fill_value,
-                    )
-                    smoothed_confidence_map = compute_confidence_map(
-                        out_mask_logits,
-                        object_ids=out_obj_ids,
-                        score_thresh=score_thresh,
-                        final_label_map=smoothed_pred_label_map,
-                        background_label=fill_value,
-                    )
-                    confidence_path = os.path.join(
-                        confidence_dir,
-                        f"{frame_names[out_frame_idx]}_confidence.png",
-                    )
-                    raw_confidence_path = os.path.join(
-                        raw_confidence_dir,
-                        f"{frame_names[out_frame_idx]}_confidence.png",
-                    )
-                    smoothed_confidence_path = os.path.join(
-                        smoothed_confidence_dir,
-                        f"{frame_names[out_frame_idx]}_confidence.png",
-                    )
-                    save_confidence_map(confidence_path, confidence_map)
-                    save_confidence_map(raw_confidence_path, confidence_map)
-                    save_confidence_map(smoothed_confidence_path, smoothed_confidence_map)
-                    confidence_stats = summarise_confidence_map(confidence_map)
-                    inference_rows[frame_names[out_frame_idx]] = {
-                        "video_name": video_name,
-                        "frame_name": frame_names[out_frame_idx],
-                        "frame_idx": out_frame_idx,
-                        "segment_id": segment_id,
-                        "num_objects": len(out_obj_ids),
-                        "confidence_path": confidence_path,
-                        **confidence_stats,
-                    }
-                else:
-                    inference_rows[frame_names[out_frame_idx]] = {
-                        "video_name": video_name,
-                        "frame_name": frame_names[out_frame_idx],
-                        "frame_idx": out_frame_idx,
-                        "segment_id": segment_id,
-                        "num_objects": len(out_obj_ids),
-                        "confidence_path": None,
-                        "confidence_mean": None,
-                        "confidence_std": None,
-                        "confidence_min": None,
-                        "confidence_max": None,
-                    }
-                # write the output masks as palette PNG files to output_mask_dir
+            if overseer_mask_dir is not None:
                 save_masks_to_dir(
-                    output_mask_dir=output_mask_dir,
+                    output_mask_dir=overseer_mask_dir,
                     video_name=video_name,
                     frame_name=frame_names[out_frame_idx],
-                    per_obj_output_mask=per_obj_output_mask,
+                    per_obj_output_mask=current_overseer_mask,
                     height=height,
                     width=width,
                     output_palette=palette,
@@ -1201,283 +1169,260 @@ def sasvi_inference(
                     shift_by_1=shift_by_1,
                 )
 
-                if overseer_mask_dir is not None:
-                    save_masks_to_dir(
-                        output_mask_dir=overseer_mask_dir,
-                        video_name=video_name,
-                        frame_name=frame_names[out_frame_idx],
-                        per_obj_output_mask=current_overseer_mask,
-                        height=height,
-                        width=width,
-                        output_palette=palette,
-                        save_binary_mask=save_binary_mask,
-                        num_classes=num_classes,
-                        shift_by_1=shift_by_1,
-                    )
-
-                gt_mask_path = resolve_gt_mask_path(
-                    frame_name=frame_names[out_frame_idx],
-                    video_dir=video_dir,
-                    video_name=video_name,
-                    base_video_dir=base_video_dir,
-                    gt_root_dir=gt_root_dir,
+            gt_mask_path = resolve_gt_mask_path(
+                frame_name=frame_names[out_frame_idx],
+                video_dir=video_dir,
+                video_name=video_name,
+                base_video_dir=base_video_dir,
+                gt_root_dir=gt_root_dir,
+            )
+            gt_metrics = {
+                "gt_mask_path": gt_mask_path,
+                "gt_pixel_accuracy": None,
+                "gt_macro_iou": None,
+                "gt_macro_dice": None,
+                "gt_error_rate": None,
+            }
+            if gt_mask_path is not None:
+                pred_label_map = per_obj_mask_to_label_map(
+                    per_obj_mask=per_obj_output_mask,
+                    height=height,
+                    width=width,
+                    shift_by_1=shift_by_1,
                 )
-                gt_metrics = {
-                    "gt_mask_path": gt_mask_path,
-                    "gt_pixel_accuracy": None,
-                    "gt_macro_iou": None,
-                    "gt_macro_dice": None,
-                    "gt_error_rate": None,
-                }
-                if gt_mask_path is not None:
-                    gt_label_map = load_dataset_mask(gt_mask_path, gt_dataset_config)
-                    gt_frame_metrics = compute_frame_metrics(
-                        pred_mask=pred_label_map,
-                        gt_mask=gt_label_map,
-                        dataset_config=gt_dataset_config,
-                    )
-                    if gt_frame_metrics["macro_iou"] is not None:
-                        gt_metrics = {
-                            "gt_mask_path": gt_mask_path,
-                            "gt_pixel_accuracy": gt_frame_metrics["pixel_accuracy"],
-                            "gt_macro_iou": gt_frame_metrics["macro_iou"],
-                            "gt_macro_dice": gt_frame_metrics["macro_dice"],
-                            "gt_error_rate": gt_frame_metrics["error_rate"],
-                        }
-                        gt_macro_ious.append(gt_frame_metrics["macro_iou"])
-                        gt_macro_dices.append(gt_frame_metrics["macro_dice"])
-                        gt_pixel_accuracies.append(gt_frame_metrics["pixel_accuracy"])
-                        video_summary["gt_frames_evaluated"] += 1
+                gt_label_map = load_dataset_mask(gt_mask_path, gt_dataset_config)
+                gt_frame_metrics = compute_frame_metrics(
+                    pred_mask=pred_label_map,
+                    gt_mask=gt_label_map,
+                    dataset_config=gt_dataset_config,
+                )
+                if gt_frame_metrics["macro_iou"] is not None:
+                    gt_metrics = {
+                        "gt_mask_path": gt_mask_path,
+                        "gt_pixel_accuracy": gt_frame_metrics["pixel_accuracy"],
+                        "gt_macro_iou": gt_frame_metrics["macro_iou"],
+                        "gt_macro_dice": gt_frame_metrics["macro_dice"],
+                        "gt_error_rate": gt_frame_metrics["error_rate"],
+                    }
+                    gt_macro_ious.append(gt_frame_metrics["macro_iou"])
+                    gt_macro_dices.append(gt_frame_metrics["macro_dice"])
+                    gt_pixel_accuracies.append(gt_frame_metrics["pixel_accuracy"])
+                    video_summary["gt_frames_evaluated"] += 1
 
-                bad_disagreement_frame = False
-                if enable_disagreement_gate and out_frame_idx > segment_start_idx:
-                    # Require both semantic and foreground disagreement so label-only mismatch
-                    # does not keep resetting the segment when the masks still overlap well.
+            bad_disagreement_frame = False
+            if enable_disagreement_gate and out_frame_idx > segment_start_idx:
+                bad_disagreement_frame = disagreement_metrics["iou"] < disagreement_iou_threshold
+                if enable_boundary_distance_gate and boundary_distance is not None:
                     bad_disagreement_frame = (
-                        disagreement_metrics["iou"] < disagreement_iou_threshold
-                        and disagreement_metrics["foreground_iou"] < disagreement_foreground_iou_threshold
+                        bad_disagreement_frame
+                        or boundary_distance > boundary_distance_threshold
                     )
-                    if enable_boundary_distance_gate and boundary_distance is not None:
-                        bad_disagreement_frame = (
-                            bad_disagreement_frame
-                            or boundary_distance > boundary_distance_threshold
-                        )
-                    disagreement_counter = disagreement_counter + 1 if bad_disagreement_frame else 0
-                else:
-                    disagreement_counter = 0
-
-                video_summary["frames_processed"] += 1
-                per_frame_ious.append(disagreement_metrics["iou"])
-
-                future_n_frame = min(10, len(frame_names) - idx)
-                per_obj_input_mask_n = []
-                duplicate_list = []
-                negative_duplicate_list = []
-                partial_duplicate_list = []
-                prompt_label_list = []
-                class_change_trigger = False
-                disagreement_trigger = False
-                reprompt_executed = False
-                reprompt_reason = ""
-
-                # getting overseer prediction and caching them for future use
-                for n in range(future_n_frame):
-                    per_obj_input_mask_n.append(
-                        ensure_cached_overseer_prediction(
-                            cache=per_obj_input_mask_cached,
-                            frame_idx=idx + n,
-                            frame_names=frame_names,
-                            frame_path_by_name=frame_path_by_name,
-                            overseer_model=overseer_model,
-                            reshape_size=(height, width),
-                        )
-                    )
-
-                # getting separate unique labels for each frame in per_obj_input_mask_n
-                unique_lable_n = get_unique_label(per_obj_input_mask_n)
-                if idx == 0:
-                    old_label = unique_lable_n[0]
-                else:
-                    current_label = unique_lable_n[0]
-                    
-                    # to restart the inference after 50 frames to avoid false labels to continue longer
-                    buffer_length -= 1                    
-                    if buffer_length == 0:
-                        trigger_next_idx = min(idx + 1, len(frame_names))
-                        break
-                    
-                    if old_label != current_label:
-                        # only if current label have new objects compared to old label (when tool entering scene). But not when a tool exiting!
-                        #TODO: Can define this as parameter and be more dynamic
-                        # also ignoring labels that appear in one frame but not in next 3 frames
-                        new_obj_label = list(set(current_label) - set(old_label))
-                        unique_lable_n = unique_lable_n[1:4]
-                        for unique_l in unique_lable_n:
-                            new_obj_label = list(set(new_obj_label) & set(unique_l))
-                        
-                        if new_obj_label:
-                            # find out exact duplicates of new_obj_label, and run analysis on them
-                            for new_obj in new_obj_label:
-                                mask1 = per_obj_input_mask_n[0][new_obj]
-                                for obj in current_label:
-                                    mask2 = per_obj_input_mask_n[0][obj]
-
-                                    true_positions_1 = (mask1 == 1)
-                                    true_positions_2 = (mask2 == 1)
-                                    matching_true_positions = np.logical_and(true_positions_1, true_positions_2)
-                                    similarity_1 = np.sum(matching_true_positions) / np.sum(true_positions_1)
-                                    similarity_2 = np.sum(matching_true_positions) / np.sum(true_positions_2)
-
-                                    # true duplicate
-                                    if similarity_1 >= 0.70 and similarity_2 >= 0.70 and obj != new_obj:
-                                        # directly append if empty, else check if the reverse pair already exist
-                                        if not duplicate_list:
-                                            duplicate_list.append([obj, new_obj])
-                                        else:
-                                            common_element_flag = False
-                                            for sublist in duplicate_list:
-                                                if list(set(sublist) & set([obj, new_obj])):
-                                                    common_element_flag = True
-                                                    new_element = list(set([obj, new_obj]) - set(sublist))
-                                                    if new_element: sublist.append(new_element[0])
-                                            if not common_element_flag:
-                                                duplicate_list.append([obj, new_obj])
-                                    
-                                    # if one similarity is high but not other way, partial duplicate and remove the smaller label
-                                    elif similarity_1 >= 0.70 and similarity_2 < 0.70:
-                                        partial_duplicate_list.append(new_obj)
-                            
-                            # if new duplicate is being replaced, we need to remove it (Kinda doing this with false_positions, but need to be more explicit)                            
-                            if duplicate_list:
-                                negative_duplicate_list = duplicate_list
-                                for sublist in duplicate_list:
-                                    # prompt label is the one that will actually be used for new prompting
-                                    # negative_duplicate_list just filters added sublist                           
-                                    selections, use_nnunet = choose_duplicate_label(per_obj_mask_n=per_obj_input_mask_n, duplicate_label=sublist)
-                                    
-                                    prompt_label = max(selections, key=selections.get)
-                                    # use nnunet almost in ensembling fashion for error propagation
-                                    if use_nnunet and nnunet_model is not None:
-                                        per_obj_input_mask_nnunet = nnunet_model.get_prediction(frame_path_by_name[frame_names[idx]], reshape_size=(width, height))
-                                        area_to_check = per_obj_input_mask_n[0][prompt_label]
-
-                                        for key in selections:
-                                            if key in per_obj_input_mask_nnunet:
-                                                selections[key] += np.sum(np.logical_and(area_to_check, per_obj_input_mask_nnunet[key]))
-                                        prompt_label = max(selections, key=selections.get)
-
-                                    if prompt_label not in old_label:
-                                        prompt_label_list.append(prompt_label)
-                                    negative_duplicate_list = [[x for x in slist if x != prompt_label] for slist in negative_duplicate_list]
-
-                            # if new label without any duplicate        
-                            if new_obj_label:
-                                single_label = list((set(new_obj_label) - set([x for xs in duplicate_list for x in xs])) - set(partial_duplicate_list))
-                                if single_label:
-                                    for ixn in single_label:
-                                        if ixn not in old_label:
-                                            prompt_label_list.append(ixn)
-
-                            if prompt_label_list:
-                                if break_endless_loop:
-                                    break_endless_loop = False 
-                                    idx += 1
-                                    continue
-                                class_change_trigger = True
-                                reprompt_executed = True
-                                reprompt_reason = "class-change"
-                                video_summary["class_change_reprompts"] += 1
-                                trigger_next_idx = idx
-                                print(
-                                    f"[reprompt] video={video_name} frame={frame_names[idx]} idx={idx} "
-                                    f"reason=class-change labels={prompt_label_list}"
-                                )
-                            break_endless_loop = False
-
-                    old_label = list(set(old_label) & set(current_label)) + prompt_label_list
-
-                if (
-                    not class_change_trigger
-                    and enable_disagreement_gate
-                    and out_frame_idx > segment_start_idx
-                    and disagreement_counter >= disagreement_bad_frames
-                ):
-                    disagreement_trigger = True
-                    reprompt_executed = True
-                    reprompt_reason = "disagreement"
-                    trigger_next_idx = idx
-                    prompt_label_list = []
-                    negative_duplicate_list = []
-                    current_label = sorted(set(current_overseer_mask.keys()))
-                    old_label = current_label.copy()
-                    video_summary["disagreement_reprompts"] += 1
-                    print(
-                        f"[reprompt] video={video_name} frame={frame_names[idx]} idx={idx} "
-                        f"reason=disagreement iou={disagreement_metrics['iou']:.4f} "
-                        f"counter={disagreement_counter}"
-                    )
-
-                trace_row = {
-                    **inference_rows[frame_names[out_frame_idx]],
-                    "sam2_vs_overseer_iou": disagreement_metrics["iou"],
-                    "sam2_vs_overseer_fg_iou": disagreement_metrics["foreground_iou"],
-                    "sam2_vs_overseer_boundary_distance": boundary_distance,
-                    "disagreement_bad_frame": bad_disagreement_frame,
-                    "disagreement_counter": disagreement_counter,
-                    "class_change_trigger": class_change_trigger,
-                    "disagreement_trigger": disagreement_trigger,
-                    "reprompt_executed": reprompt_executed,
-                    "reprompt_reason": reprompt_reason,
-                    **gt_metrics,
-                }
-                trace_rows.append(trace_row)
-                print(
-                    f"[trace] video={video_name} frame={frame_names[out_frame_idx]} idx={out_frame_idx} "
-                    f"segment={segment_id} iou={disagreement_metrics['iou']:.4f} "
-                    f"fg_iou={disagreement_metrics['foreground_iou']:.4f} "
-                    f"boundary={'n/a' if boundary_distance is None or not np.isfinite(boundary_distance) else f'{boundary_distance:.4f}'} "
-                    f"class_change={class_change_trigger} disagreement={disagreement_trigger} "
-                    f"bad={bad_disagreement_frame} counter={disagreement_counter} "
-                    f"reprompt={reprompt_executed} reason={reprompt_reason or 'none'}"
-                )
-                if not disable_tqdm:
-                    frame_progress.set_postfix(
-                        segment=segment_id,
-                        class_rp=video_summary["class_change_reprompts"],
-                        disagree_rp=video_summary["disagreement_reprompts"],
-                    )
-
-                if (
-                    disagreement_visual_dir is not None
-                    and disagreement_visual_count < max_disagreement_visuals
-                    and (bad_disagreement_frame or reprompt_executed)
-                ):
-                    visual_path = os.path.join(
-                        disagreement_visual_dir,
-                        f"{frame_names[out_frame_idx]}_segment{segment_id}_disagreement.png",
-                    )
-                    save_disagreement_visual(
-                        path=visual_path,
-                        frame_path=frame_path_by_name[frame_names[out_frame_idx]],
-                        sam_foreground=disagreement_metrics["sam_foreground"],
-                        overseer_foreground=disagreement_metrics["overseer_foreground"],
-                    )
-                    disagreement_visual_count += 1
-
-                if reprompt_executed:
-                    break
-                idx += 1
-            if trigger_next_idx is None:
-                if idx >= len(frame_names) - 1:
-                    idx = len(frame_names)
-                else:
-                    idx += 1
+                disagreement_counter = disagreement_counter + 1 if bad_disagreement_frame else 0
             else:
-                idx = trigger_next_idx
-    finally:
-        if max_completed_frame_idx + 1 > frame_progress.n:
-            frame_progress.update(max_completed_frame_idx + 1 - frame_progress.n)
-        frame_progress.close()
+                disagreement_counter = 0
+
+            video_summary["frames_processed"] += 1
+            per_frame_ious.append(disagreement_metrics["iou"])
+
+            future_n_frame = min(10, len(frame_names) - idx)
+            per_obj_input_mask_n = []
+            duplicate_list = []
+            negative_duplicate_list = []
+            partial_duplicate_list = []
+            prompt_label_list = []
+            class_change_trigger = False
+            disagreement_trigger = False
+            reprompt_executed = False
+            reprompt_reason = ""
+
+            # getting overseer prediction and caching them for future use
+            for n in range(future_n_frame):
+                per_obj_input_mask_n.append(
+                    ensure_cached_overseer_prediction(
+                        cache=per_obj_input_mask_cached,
+                        frame_idx=idx + n,
+                        frame_names=frame_names,
+                        frame_path_by_name=frame_path_by_name,
+                        overseer_model=overseer_model,
+                        reshape_size=(height, width),
+                    )
+                )
+
+            # getting separate unique labels for each frame in per_obj_input_mask_n
+            unique_lable_n = get_unique_label(per_obj_input_mask_n)
+            if idx == 0:
+                old_label = unique_lable_n[0]
+            else:
+                current_label = unique_lable_n[0]
+                
+                # to restart the inference after 50 frames to avoid false labels to continue longer
+                buffer_length -= 1                    
+                if buffer_length == 0:
+                    trigger_next_idx = min(idx + 1, len(frame_names))
+                    break
+                
+                if old_label != current_label:
+                    # only if current label have new objects compared to old label (when tool entering scene). But not when a tool exiting!
+                    #TODO: Can define this as parameter and be more dynamic
+                    # also ignoring labels that appear in one frame but not in next 3 frames
+                    new_obj_label = list(set(current_label) - set(old_label))
+                    unique_lable_n = unique_lable_n[1:4]
+                    for unique_l in unique_lable_n:
+                        new_obj_label = list(set(new_obj_label) & set(unique_l))
+                    
+                    if new_obj_label:
+                        # find out exact duplicates of new_obj_label, and run analysis on them
+                        for new_obj in new_obj_label:
+                            mask1 = per_obj_input_mask_n[0][new_obj]
+                            for obj in current_label:
+                                mask2 = per_obj_input_mask_n[0][obj]
+
+                                true_positions_1 = (mask1 == 1)
+                                true_positions_2 = (mask2 == 1)
+                                matching_true_positions = np.logical_and(true_positions_1, true_positions_2)
+                                similarity_1 = np.sum(matching_true_positions) / np.sum(true_positions_1)
+                                similarity_2 = np.sum(matching_true_positions) / np.sum(true_positions_2)
+
+                                # true duplicate
+                                if similarity_1 >= 0.70 and similarity_2 >= 0.70 and obj != new_obj:
+                                    # directly append if empty, else check if the reverse pair already exist
+                                    if not duplicate_list:
+                                        duplicate_list.append([obj, new_obj])
+                                    else:
+                                        common_element_flag = False
+                                        for sublist in duplicate_list:
+                                            if list(set(sublist) & set([obj, new_obj])):
+                                                common_element_flag = True
+                                                new_element = list(set([obj, new_obj]) - set(sublist))
+                                                if new_element: sublist.append(new_element[0])
+                                        if not common_element_flag:
+                                            duplicate_list.append([obj, new_obj])
+                                
+                                # if one similarity is high but not other way, partial duplicate and remove the smaller label
+                                elif similarity_1 >= 0.70 and similarity_2 < 0.70:
+                                    partial_duplicate_list.append(new_obj)
+                        
+                        # if new duplicate is being replaced, we need to remove it (Kinda doing this with false_positions, but need to be more explicit)                            
+                        if duplicate_list:
+                            negative_duplicate_list = duplicate_list
+                            for sublist in duplicate_list:
+                                # prompt label is the one that will actually be used for new prompting
+                                # negative_duplicate_list just filters added sublist                           
+                                selections, use_nnunet = choose_duplicate_label(per_obj_mask_n=per_obj_input_mask_n, duplicate_label=sublist)
+                                
+                                prompt_label = max(selections, key=selections.get)
+                                # use nnunet almost in ensembling fashion for error propagation
+                                if use_nnunet and nnunet_model is not None:
+                                    per_obj_input_mask_nnunet = nnunet_model.get_prediction(frame_path_by_name[frame_names[idx]], reshape_size=(width, height))
+                                    area_to_check = per_obj_input_mask_n[0][prompt_label]
+
+                                    for key in selections:
+                                        if key in per_obj_input_mask_nnunet:
+                                            selections[key] += np.sum(np.logical_and(area_to_check, per_obj_input_mask_nnunet[key]))
+                                    prompt_label = max(selections, key=selections.get)
+
+                                if prompt_label not in old_label:
+                                    prompt_label_list.append(prompt_label)
+                                negative_duplicate_list = [[x for x in slist if x != prompt_label] for slist in negative_duplicate_list]
+
+                        # if new label without any duplicate        
+                        if new_obj_label:
+                            single_label = list((set(new_obj_label) - set([x for xs in duplicate_list for x in xs])) - set(partial_duplicate_list))
+                            if single_label:
+                                for ixn in single_label:
+                                    if ixn not in old_label:
+                                        prompt_label_list.append(ixn)
+
+                        if prompt_label_list:
+                            if break_endless_loop:
+                                break_endless_loop = False 
+                                idx += 1
+                                continue
+                            class_change_trigger = True
+                            reprompt_executed = True
+                            reprompt_reason = "class-change"
+                            video_summary["class_change_reprompts"] += 1
+                            trigger_next_idx = idx
+                            print(
+                                f"[reprompt] video={video_name} frame={frame_names[idx]} idx={idx} "
+                                f"reason=class-change labels={prompt_label_list}"
+                            )
+                        break_endless_loop = False
+
+                old_label = list(set(old_label) & set(current_label)) + prompt_label_list
+
+            if (
+                not class_change_trigger
+                and enable_disagreement_gate
+                and out_frame_idx > segment_start_idx
+                and disagreement_counter >= disagreement_bad_frames
+            ):
+                disagreement_trigger = True
+                reprompt_executed = True
+                reprompt_reason = "disagreement"
+                trigger_next_idx = idx
+                prompt_label_list = []
+                negative_duplicate_list = []
+                current_label = sorted(set(current_overseer_mask.keys()))
+                old_label = current_label.copy()
+                video_summary["disagreement_reprompts"] += 1
+                print(
+                    f"[reprompt] video={video_name} frame={frame_names[idx]} idx={idx} "
+                    f"reason=disagreement iou={disagreement_metrics['iou']:.4f} "
+                    f"counter={disagreement_counter}"
+                )
+
+            trace_row = {
+                **inference_rows[frame_names[out_frame_idx]],
+                "sam2_vs_overseer_iou": disagreement_metrics["iou"],
+                "sam2_vs_overseer_fg_iou": disagreement_metrics["foreground_iou"],
+                "sam2_vs_overseer_boundary_distance": boundary_distance,
+                "disagreement_bad_frame": bad_disagreement_frame,
+                "disagreement_counter": disagreement_counter,
+                "class_change_trigger": class_change_trigger,
+                "disagreement_trigger": disagreement_trigger,
+                "reprompt_executed": reprompt_executed,
+                "reprompt_reason": reprompt_reason,
+                **gt_metrics,
+            }
+            trace_rows.append(trace_row)
+            print(
+                f"[trace] video={video_name} frame={frame_names[out_frame_idx]} idx={out_frame_idx} "
+                f"segment={segment_id} iou={disagreement_metrics['iou']:.4f} "
+                f"fg_iou={disagreement_metrics['foreground_iou']:.4f} "
+                f"boundary={'n/a' if boundary_distance is None or not np.isfinite(boundary_distance) else f'{boundary_distance:.4f}'} "
+                f"class_change={class_change_trigger} disagreement={disagreement_trigger} "
+                f"bad={bad_disagreement_frame} counter={disagreement_counter} "
+                f"reprompt={reprompt_executed} reason={reprompt_reason or 'none'}"
+            )
+
+            if (
+                disagreement_visual_dir is not None
+                and disagreement_visual_count < max_disagreement_visuals
+                and (bad_disagreement_frame or reprompt_executed)
+            ):
+                visual_path = os.path.join(
+                    disagreement_visual_dir,
+                    f"{frame_names[out_frame_idx]}_segment{segment_id}_disagreement.png",
+                )
+                save_disagreement_visual(
+                    path=visual_path,
+                    frame_path=frame_path_by_name[frame_names[out_frame_idx]],
+                    sam_foreground=disagreement_metrics["sam_foreground"],
+                    overseer_foreground=disagreement_metrics["overseer_foreground"],
+                )
+                disagreement_visual_count += 1
+
+            if reprompt_executed:
+                break
+            idx += 1
+        if trigger_next_idx is None:
+            if idx >= len(frame_names) - 1:
+                idx = len(frame_names)
+            else:
+                idx += 1
+        else:
+            idx = trigger_next_idx
     if temp_subset_root is not None:
         try:
             for frame_info in frame_infos:
@@ -1629,18 +1574,6 @@ def main():
         help="trigger a bad disagreement frame when SAM2 vs Overseer IoU falls below this value.",
     )
     parser.add_argument(
-        "--disagreement_foreground_iou_threshold",
-        type=float,
-        default=0.98,
-        help="also require SAM2 vs Overseer foreground IoU to fall below this value before a disagreement frame is considered bad.",
-    )
-    parser.add_argument(
-        "--disagreement_min_label_area",
-        type=int,
-        default=100,
-        help="ignore labels smaller than this many pixels when computing disagreement IoU, and area-weight the remaining labels.",
-    )
-    parser.add_argument(
         "--disagreement_bad_frames",
         type=int,
         default=2,
@@ -1667,11 +1600,6 @@ def main():
         type=int,
         default=10,
         help="maximum number of disagreement debug visuals to save per video.",
-    )
-    parser.add_argument(
-        "--disable_tqdm",
-        action="store_true",
-        help="disable tqdm progress bars for cleaner logs.",
     )
     args = parser.parse_args()
     if args.frame_name is not None and (args.start_frame is not None or args.end_frame is not None):
@@ -1743,8 +1671,8 @@ def main():
     else:        
         raise NotImplementedError
 
+    palette = get_primary_visual_palette(num_classes)
     gt_dataset_config = get_dataset_config(args.dataset_type)
-    palette = gt_dataset_config.palette
 
     if args.overseer_type == "MaskRCNN":
         maskrcnn_model = get_model_instance_segmentation(
@@ -1810,14 +1738,8 @@ def main():
     inference_rows = []
     video_summaries = []
     
-    video_iterator = tqdm(
-        video_entries,
-        desc="eval_sasvi",
-        unit="video",
-        disable=args.disable_tqdm,
-    )
-    for n_video, (video_name, video_dir) in enumerate(video_iterator, start=1):
-        print(f"\n{n_video}/{len(video_names)} - running on {video_name}")
+    for n_video, (video_name, video_dir) in enumerate(video_entries):
+        print(f"\n{n_video + 1}/{len(video_names)} - running on {video_name}")
         video_rows, video_summary = sasvi_inference(
             predictor=predictor,
             base_video_dir=args.base_video_dir,
@@ -1846,23 +1768,14 @@ def main():
             analysis_output_dir=args.analysis_output_dir,
             enable_disagreement_gate=args.enable_disagreement_gate,
             disagreement_iou_threshold=args.disagreement_iou_threshold,
-            disagreement_foreground_iou_threshold=args.disagreement_foreground_iou_threshold,
-            disagreement_min_label_area=args.disagreement_min_label_area,
             disagreement_bad_frames=args.disagreement_bad_frames,
             enable_boundary_distance_gate=args.enable_boundary_distance_gate,
             boundary_distance_threshold=args.boundary_distance_threshold,
             save_disagreement_visuals=args.save_disagreement_visuals,
             max_disagreement_visuals=args.max_disagreement_visuals,
-            disable_tqdm=args.disable_tqdm,
         )
         inference_rows.extend(video_rows)
         video_summaries.append(video_summary)
-        if not args.disable_tqdm:
-            video_iterator.set_postfix(
-                segments=video_summary["segments_started"],
-                class_rp=video_summary["class_change_reprompts"],
-                disagree_rp=video_summary["disagreement_reprompts"],
-            )
 
     if args.analysis_output_dir is not None and len(inference_rows) > 0:
         metadata_path = os.path.join(args.analysis_output_dir, "inference", "inference_metadata.csv")
@@ -1882,8 +1795,6 @@ def main():
                 "end_frame": args.end_frame,
                 "enable_disagreement_gate": args.enable_disagreement_gate,
                 "disagreement_iou_threshold": args.disagreement_iou_threshold,
-                "disagreement_foreground_iou_threshold": args.disagreement_foreground_iou_threshold,
-                "disagreement_min_label_area": args.disagreement_min_label_area,
                 "disagreement_bad_frames": args.disagreement_bad_frames,
                 "enable_boundary_distance_gate": args.enable_boundary_distance_gate,
                 "boundary_distance_threshold": args.boundary_distance_threshold,

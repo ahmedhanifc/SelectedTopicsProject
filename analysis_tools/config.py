@@ -83,46 +83,6 @@ def _normalise_palette(palette: np.ndarray | list) -> np.ndarray:
     return palette_arr
 
 
-def get_distinct_visual_palette(
-    num_classes: int,
-    background_index: int | None = None,
-) -> np.ndarray:
-    """Return a high-contrast palette without near-gradient class collisions."""
-    vivid_colors = np.array([
-        [254, 0, 0],     # red
-        [0, 0, 254],     # blue
-        [0, 166, 237],   # cyan
-        [255, 196, 0],   # yellow
-        [153, 41, 234],  # purple
-        [126, 0, 152],   # purple
-        [255, 104, 0],   # orange
-        [255, 0, 170],   # magenta
-        [95, 57, 19],    # brown
-        [24, 196, 52],   # green
-        [128, 128, 0],   # olive
-        [0, 0, 128],     # navy
-        [170, 0, 0],     # maroon
-        [46, 139, 87],   # sea green
-        [255, 140, 0],   # amber orange
-        [75, 0, 130],    # indigo
-        [139, 69, 19],   # saddle brown
-        [47, 79, 79],    # slate
-        [0, 0, 205],     # strong royal blue
-        [199, 21, 133],  # deep pink
-    ], dtype=np.uint8)
-    background_color = np.array([127, 127, 127], dtype=np.uint8)
-
-    palette = np.zeros((num_classes, 3), dtype=np.uint8)
-    color_cursor = 0
-    for class_index in range(num_classes):
-        if background_index is not None and class_index == background_index:
-            palette[class_index] = background_color
-            continue
-        palette[class_index] = vivid_colors[color_cursor % len(vivid_colors)]
-        color_cursor += 1
-    return palette
-
-
 def get_dataset_config(dataset_type: str,
                        ignore_index: int | None = None,
                        background_index: int | None = None) -> DatasetConfig:
@@ -131,10 +91,12 @@ def get_dataset_config(dataset_type: str,
         default_ignore = 255
         default_background = None
         num_classes = 18
+        palette = get_cadis_colormap()
     elif dataset_key == "CHOLECSEG8K":
         default_ignore = None
         default_background = 0
         num_classes = 13
+        palette = get_cholecseg8k_colormap()
         rgb_label_map = {
             (255, 255, 255): 0,
             (50, 50, 50): 0,
@@ -155,23 +117,18 @@ def get_dataset_config(dataset_type: str,
         default_ignore = None
         default_background = 0
         num_classes = 14
+        palette = get_cataract1k_colormap()
         rgb_label_map = None
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
     if dataset_key == "CADIS":
         rgb_label_map = None
 
-    resolved_background = default_background if background_index is None else background_index
-    palette = get_distinct_visual_palette(
-        num_classes=num_classes,
-        background_index=resolved_background,
-    )
-
     return DatasetConfig(
         dataset_type=dataset_key,
         num_classes=num_classes,
         ignore_index=default_ignore if ignore_index is None else ignore_index,
-        background_index=resolved_background,
+        background_index=default_background if background_index is None else background_index,
         palette=_normalise_palette(palette),
         rgb_label_map=rgb_label_map,
     )

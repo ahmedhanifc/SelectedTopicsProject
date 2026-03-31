@@ -9,4 +9,3 @@ scikit-image==0.22.0
 matplotlib
 transformers
 opencv-python
-decord

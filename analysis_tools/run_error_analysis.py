@@ -25,16 +25,7 @@ def main() -> None:
     parser.add_argument("--image_suffix", type=str, default=".jpg", help="Filename suffix for input frames.")
     parser.add_argument("--ignore_index", type=int, default=None, help="Optional override for dataset ignore index.")
     parser.add_argument("--background_index", type=int, default=None, help="Optional override for dataset background index.")
-    parser.add_argument("--confidence_low_threshold", type=float, default=0.50, help="Low-confidence threshold used for overlay patterning.")
-    parser.add_argument("--confidence_medium_threshold", type=float, default=0.80, help="Medium-confidence threshold used for overlay patterning.")
     args = parser.parse_args()
-
-    if not 0.0 <= args.confidence_low_threshold <= 1.0:
-        raise SystemExit("--confidence_low_threshold must be between 0.0 and 1.0")
-    if not 0.0 <= args.confidence_medium_threshold <= 1.0:
-        raise SystemExit("--confidence_medium_threshold must be between 0.0 and 1.0")
-    if args.confidence_low_threshold > args.confidence_medium_threshold:
-        raise SystemExit("--confidence_low_threshold must be <= --confidence_medium_threshold")
 
     dataset_config = get_dataset_config(
         dataset_type=args.dataset_type,
@@ -52,8 +43,6 @@ def main() -> None:
         pred_mask_suffix=args.pred_mask_suffix,
         gt_mask_suffix=args.gt_mask_suffix,
         image_suffix=args.image_suffix,
-        low_confidence_threshold=args.confidence_low_threshold,
-        medium_confidence_threshold=args.confidence_medium_threshold,
     )
     print(f"Analyzed {summary['frames_analyzed']} frame(s) into {args.output_root}")
 
