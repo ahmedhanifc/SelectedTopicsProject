@@ -11,6 +11,7 @@ type VideoPanelProps = {
   mode: DisplayMode;
   rawSrc: string | null;
   maskSrc: string | null;
+  confidenceSrc: string | null;
   confidenceOverlayEnabled: boolean;
   focusPoint: FocusPoint;
   onFocusChange: (source: FocusSource, point: FocusPoint) => void;
@@ -267,14 +268,16 @@ export default function VideoPanel({
   mode,
   rawSrc,
   maskSrc,
+  confidenceSrc,
   confidenceOverlayEnabled,
   focusPoint,
   onFocusChange
 }: VideoPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const activeOverlaySrc = confidenceOverlayEnabled && confidenceSrc ? confidenceSrc : maskSrc;
 
   useEffect(() => {
-    if (mode !== "BLENDED" || !rawSrc || !maskSrc || !canvasRef.current) {
+    if (mode !== "BLENDED" || !rawSrc || !activeOverlaySrc || !canvasRef.current) {
       return;
     }
 
@@ -300,8 +303,16 @@ export default function VideoPanel({
       context.clearRect(0, 0, canvas.width, canvas.height);
       context.globalAlpha = 1;
       context.drawImage(rawImage, 0, 0);
-      context.globalAlpha = confidenceOverlayEnabled ? 0.42 : 0.18;
+      if (confidenceOverlayEnabled) {
+        context.filter = "none";
+        context.globalAlpha = 0.42;
+      } else {
+        // Without confidence patterning, boost mask visibility so segment boundaries remain distinguishable.
+        context.filter = "saturate(1.45) contrast(1.25)";
+        context.globalAlpha = 0.52;
+      }
       context.drawImage(maskImage, 0, 0, canvas.width, canvas.height);
+      context.filter = "none";
       context.globalAlpha = 1;
     };
 
@@ -315,8 +326,8 @@ export default function VideoPanel({
     };
 
     rawImage.src = rawSrc;
-    maskImage.src = maskSrc;
-  }, [confidenceOverlayEnabled, maskSrc, mode, rawSrc]);
+    maskImage.src = activeOverlaySrc;
+  }, [activeOverlaySrc, confidenceOverlayEnabled, mode, rawSrc]);
 
   const stageLabel =
     mode === "RAW"
@@ -350,7 +361,7 @@ export default function VideoPanel({
               <span className="stage-label">Segmented view</span>
             </div>
             <InteractiveImage
-              src={maskSrc}
+              src={activeOverlaySrc}
               alt="Segmented frame"
               source="mask"
               focusPoint={focusPoint}
@@ -377,7 +388,7 @@ export default function VideoPanel({
 
           {mode === "SEGMENTED" ? (
             <InteractiveImage
-              src={maskSrc}
+              src={activeOverlaySrc}
               alt="Segmented frame"
               source="mask"
               focusPoint={focusPoint}

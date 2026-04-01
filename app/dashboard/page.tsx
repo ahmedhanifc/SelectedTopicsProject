@@ -11,6 +11,7 @@ type FramePayload = {
   fps: number;
   frames: string[];
   masks: string[];
+  confidenceMasks?: Array<string | null>;
 };
 
 export default function DashboardPage() {
@@ -69,7 +70,8 @@ export default function DashboardPage() {
     }
     return {
       raw: payload.frames[frameIndex] ?? payload.frames[0],
-      mask: payload.masks[frameIndex] ?? payload.masks[0]
+      mask: payload.masks[frameIndex] ?? payload.masks[0],
+      confidence: payload.confidenceMasks?.[frameIndex] ?? null
     };
   }, [frameIndex, payload]);
 
@@ -80,29 +82,22 @@ export default function DashboardPage() {
       <section className={sidebarCollapsed ? "monitor-frame sidebar-collapsed" : "monitor-frame"}>
         <aside className={sidebarCollapsed ? "sidebar-shell collapsed" : "sidebar-shell"}>
           <div className="sidebar-topbar">
-            {sidebarCollapsed ? (
-              <button
-                type="button"
-                className="sidebar-toggle"
-                onClick={() => setSidebarCollapsed(false)}
-                aria-label="Expand sidebar"
-              >
-                +
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="sidebar-toggle close"
-                onClick={() => setSidebarCollapsed(true)}
-                aria-label="Collapse sidebar"
-              >
-                {"\u00D7"}
-              </button>
-            )}
+            <button
+              type="button"
+              className={sidebarCollapsed ? "sidebar-toggle" : "sidebar-toggle close"}
+              onClick={() => setSidebarCollapsed((value) => !value)}
+              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              <span className="sidebar-toggle-icon" aria-hidden="true">
+                {sidebarCollapsed ? "\u203A" : "\u2039"}
+              </span>
+            </button>
           </div>
 
           <section className="sidebar-card">
-            {!sidebarCollapsed ? <span className="sidebar-card-title">Modes</span> : null}
+            <span className={sidebarCollapsed ? "sidebar-card-title hidden" : "sidebar-card-title"}>
+              Modes
+            </span>
             <Controls
               mode={mode}
               onModeChange={setMode}
@@ -147,6 +142,7 @@ export default function DashboardPage() {
             mode={mode}
             rawSrc={currentFrame?.raw ?? null}
             maskSrc={currentFrame?.mask ?? null}
+            confidenceSrc={currentFrame?.confidence ?? null}
             confidenceOverlayEnabled={confidenceOverlayEnabled}
             focusPoint={focusPoint}
             onFocusChange={(source, point) => {
@@ -159,7 +155,7 @@ export default function DashboardPage() {
             <VitalsPanel />
 
             <article className="info-card">
-              <span className="mini-heading">AI focus zone</span>
+              <span className="mini-heading">Focused area</span>
               <div className="focus-card">
                 <FocusZone src={focusSrc} point={focusPoint} onFocusChange={setFocusPoint} />
               </div>
@@ -169,19 +165,19 @@ export default function DashboardPage() {
               <span className="mini-heading">Confidence legend</span>
               <ul className="legend-list">
                 <li>
-                  <i className="legend-dot high" />
-                  <span>High</span>
-                  <strong>95-100%</strong>
+                  <i className="legend-dot low" />
+                  <span>Low</span>
+                  <strong>&lt; 50%</strong>
                 </li>
                 <li>
                   <i className="legend-dot medium" />
                   <span>Medium</span>
-                  <strong>70-94%</strong>
+                  <strong>50-79%</strong>
                 </li>
                 <li>
-                  <i className="legend-dot low" />
-                  <span>Low</span>
-                  <strong>&lt; 70%</strong>
+                  <i className="legend-dot high" />
+                  <span>High</span>
+                  <strong>80-100%</strong>
                 </li>
               </ul>
             </article>

@@ -3,6 +3,7 @@ dataset/
 videos/
 public/
 frame_root/
+artifacts/
 gt_root/
 output_masks/
 output_masks_*/
