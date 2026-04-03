@@ -120,6 +120,7 @@ export default function DashboardPage() {
               onToggleConfidenceOverlay={() => setConfidenceOverlayEnabled((value) => !value)}
               collapsed={sidebarCollapsed}
               showModes={false}
+              showConfidenceToggle={false}
             />
           </section>
         </aside>
@@ -162,12 +163,30 @@ export default function DashboardPage() {
             </article>
 
             <article className="info-card">
-              <span className="mini-heading">Confidence legend</span>
+              <div className="legend-header">
+                <span className="mini-heading">Confidence legend</span>
+                <button
+                  type="button"
+                  className={
+                    confidenceOverlayEnabled ? "legend-switch active" : "legend-switch"
+                  }
+                  onClick={() => setConfidenceOverlayEnabled((value) => !value)}
+                  aria-pressed={confidenceOverlayEnabled}
+                  aria-label="Toggle confidence overlay"
+                >
+                  <span className="legend-switch-track">
+                    <span className="legend-switch-thumb" />
+                  </span>
+                  <span className="legend-switch-label">
+                    {confidenceOverlayEnabled ? "On" : "Off"}
+                  </span>
+                </button>
+              </div>
               <ul className="legend-list">
                 <li>
-                  <i className="legend-dot low" />
-                  <span>Low</span>
-                  <strong>&lt; 50%</strong>
+                  <i className="legend-dot high" />
+                  <span>High</span>
+                  <strong>80-100%</strong>
                 </li>
                 <li>
                   <i className="legend-dot medium" />
@@ -175,9 +194,9 @@ export default function DashboardPage() {
                   <strong>50-79%</strong>
                 </li>
                 <li>
-                  <i className="legend-dot high" />
-                  <span>High</span>
-                  <strong>80-100%</strong>
+                  <i className="legend-dot low" />
+                  <span>Low</span>
+                  <strong>&lt; 50%</strong>
                 </li>
               </ul>
             </article>

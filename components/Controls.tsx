@@ -12,13 +12,14 @@ type ControlsProps = {
   collapsed?: boolean;
   showModes?: boolean;
   showActions?: boolean;
+  showConfidenceToggle?: boolean;
 };
 
 const MODES: Array<{ id: DisplayMode; label: string; icon: string }> = [
-  { id: "RAW", label: "Raw", icon: "\u25A1" },
-  { id: "SEGMENTED", label: "Segmented", icon: "\u25C8" },
-  { id: "SPLIT", label: "Split", icon: "\u2637" },
-  { id: "BLENDED", label: "Blended", icon: "\u2248" }
+  { id: "RAW", label: "Raw", icon: "\u25C9" },
+  { id: "SEGMENTED", label: "Segmented", icon: "\u25D4" },
+  { id: "SPLIT", label: "Split", icon: "\u25EB" },
+  { id: "BLENDED", label: "Blended", icon: "\u25CD" }
 ];
 
 export default function Controls({
@@ -30,7 +31,8 @@ export default function Controls({
   onToggleConfidenceOverlay,
   collapsed = false,
   showModes = true,
-  showActions = true
+  showActions = true,
+  showConfidenceToggle = true
 }: ControlsProps) {
   return (
     <section className="control-rail">
@@ -44,7 +46,27 @@ export default function Controls({
               onClick={() => onModeChange(entry.id)}
               aria-label={entry.label}
             >
-              <span className="rail-icon">{entry.icon}</span>
+              <span
+                className={
+                  `rail-icon ${
+                    entry.id === "SEGMENTED" || entry.id === "SPLIT" || entry.id === "BLENDED"
+                      ? "detail-icon"
+                    : ""
+                  } ${entry.id === "SEGMENTED" ? "segmented-icon" : ""} ${
+                    entry.id === "RAW"
+                      ? "raw-icon"
+                      : entry.id === "SEGMENTED"
+                        ? "segmented-mode-icon"
+                        : entry.id === "SPLIT"
+                          ? "split-icon"
+                          : entry.id === "BLENDED"
+                            ? "blended-icon"
+                            : ""
+                  }`.trim()
+                }
+              >
+                {entry.icon}
+              </span>
               {!collapsed ? <span>{entry.label}</span> : null}
             </button>
           ))}
@@ -55,31 +77,38 @@ export default function Controls({
         <div className="control-actions">
           <button
             type="button"
-            className="ghost-action"
+            className={playing ? "ghost-action stream-action" : "ghost-action stream-action paused"}
             onClick={onTogglePlaying}
             aria-label={playing ? "Pause stream" : "Resume stream"}
+            aria-pressed={!playing}
           >
-            <span className="action-icon" aria-hidden="true">
-              {playing ? "\u275A\u275A" : "\u25B6"}
+            <span
+              className={playing ? "pause-glyph" : "pause-glyph paused"}
+              aria-hidden="true"
+            >
+              <i />
+              <i />
             </span>
             {!collapsed ? <span>{playing ? "Pause stream" : "Resume stream"}</span> : null}
           </button>
 
-          <button
-            type="button"
-            className="toggle-pill"
-            onClick={onToggleConfidenceOverlay}
-            aria-label="Confidence overlay"
-          >
-            <span
-              className={confidenceOverlayEnabled ? "overlay-icon active" : "overlay-icon"}
-              aria-hidden="true"
+          {showConfidenceToggle ? (
+            <button
+              type="button"
+              className="toggle-pill"
+              onClick={onToggleConfidenceOverlay}
+              aria-label="Confidence overlay"
             >
-              <i className="overlay-back" />
-              <i className="overlay-front" />
-            </span>
-            {!collapsed ? <span>Confidence overlay</span> : null}
-          </button>
+              <span
+                className={confidenceOverlayEnabled ? "overlay-icon active" : "overlay-icon"}
+                aria-hidden="true"
+              >
+                <i className="overlay-back" />
+                <i className="overlay-front" />
+              </span>
+              {!collapsed ? <span>Confidence overlay</span> : null}
+            </button>
+          ) : null}
         </div>
       ) : null}
     </section>
